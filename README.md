@@ -26,7 +26,7 @@
   <a href="#contributing">参与贡献</a>
 </p>
 
-> **当前进度**：本分支正在向多模型推理演进。当前源码包含 Qwen3 Dense 实现；Qwen3-30B-A3B、多模型注册与自动分派仍属于适配目标。下方快速开始使用 Qwen3-0.6B，目标模型与现有能力分别列出。
+> **当前进度**：已接入按 `model_type` 选择模型的统一入口，注册 Qwen3 Dense 与 Qwen3 MoE，并实现 MoE 模型结构、Router 与逐专家计算。Qwen3-30B-A3B 尚未完成运行与数值验收。下方快速开始使用 Qwen3-0.6B。
 
 <a id="about"></a>
 
@@ -50,7 +50,7 @@
 | 模型 | 架构 | 当前状态 | 说明 |
 | --- | --- | --- | --- |
 | Qwen3-0.6B | Dense / GQA | 已有代码与示例入口 | 当前回归基线；本分支 GPU 验收待补充 |
-| Qwen3-30B-A3B | MoE / GQA | 首个扩展目标，待实现 | 需要模型分派、Router、专家计算与权重加载适配 |
+| Qwen3-30B-A3B | MoE / GQA | 模型结构与注册已接入，待运行验证 | 完整权重加载、生成与数值对齐待验证 |
 | 其他模型 | 按架构扩展 | 后续规划 | 完成结构和权重审计后，再加入支持矩阵 |
 
 “已有代码”表示存在相应实现；只有提交可复现的数值和运行记录后，才标记为验证通过。同属 Qwen 系列，也不代表只替换模型路径即可运行。
@@ -69,7 +69,18 @@
 | CUDA Graph | 满足条件的 Decode 模型主体前向 |
 | 合并计算 | QKV、gate/up 投影合并，以及部分算子的 `torch.compile` |
 
-MoE / EP、量化、投机解码、PD 分离和 HTTP 服务尚未作为当前功能提供。
+MoE 已有模型实现，尚未作为验证通过的可用模型提供。EP、量化、投机解码、PD 分离和 HTTP 服务尚未实现。
+
+### MoE 接入进度与限制
+
+- **统一入口**：`ModelRunner` 已调用 `registry.build_model(hf_config)`；注册表已启用 `qwen3` 与 `qwen3_moe`，根据模型配置选择对应架构。
+- **模型结构**：已实现 MoE Attention、按层选择 Dense / MoE、Top-K 路由、选中权重归一化，以及逐专家计算和输出累加。
+- **权重路径**：模型采用逐专家 `ModuleList`，通过 `packed_modules_mapping` 复用现有 loader 的 QKV 与 gate/up 合并加载机制；真实 checkpoint 的完整加载仍需验证。
+- **执行模式**：当前路由包含依赖输入的 `nonzero()`、`.item()` 与 Python 循环，首次运行需设置 `enforce_eager=True`，尚未支持现有 CUDA Graph 捕获路径。
+- **并行方式**：Attention 和专家线性层复用 TP，Router 在各 rank 保留完整权重；当前属于 TP 实现，不包含 EP。目标模型有 4 个 KV heads，现有分片约束下 TP 候选值为 1、2、4，多卡运行尚待验证。
+- **验收待办**：验证模型创建、真实权重加载、Prefill / Decode logits、完整生成和缓存路径，再进行 TP 与性能验收。
+
+当前实现面向目标模型的 Top-8 与路由权重归一化配置；拓展到其他 MoE 配置前，还需处理 `top_k=1` 时 mask 的维度，以及按 `norm_topk_prob` 配置决定是否归一化。
 
 ### 首个 MoE 目标：Qwen3-30B-A3B
 
@@ -187,7 +198,7 @@ flowchart LR
 - **ModelRunner** 准备 GPU 输入、分配实际 KV 存储、执行模型与采样，并协调 TP 进程。
 - **Models / Layers** 定义具体架构以及可复用的计算模块。
 
-当前 `ModelRunner` 仍直接实例化 `Qwen3ForCausalLM`。多模型改造将增加模型注册与选择入口，再逐步补齐架构专属组件。
+`ModelRunner` 通过 `build_model(hf_config)` 查询模型注册表，根据 `hf_config.model_type` 创建模型。新增架构通过注册表接入，统一提供 `forward()` 与 `compute_logits()` 接口；未知模型类型会给出明确错误。
 
 ### 当前目录
 
@@ -200,7 +211,9 @@ nano-vllm/
     ├── config.py              # 引擎配置与 HF 配置读取
     ├── sampling_params.py     # 每个请求的采样参数
     ├── models/
-    │   └── qwen3.py           # 当前 Dense Qwen3 架构
+    │   ├── registry.py        # 根据 model_type 选择模型实现
+    │   ├── qwen3.py           # Dense Qwen3 架构
+    │   └── qwen3_moe.py       # Qwen3 MoE 架构，已注册，待运行验收
     ├── layers/                # 并行线性层、Attention、Norm、RoPE 等
     ├── engine/
     │   ├── llm_engine.py      # 请求生命周期
@@ -236,16 +249,18 @@ nano-vllm/
 
 ### 第一阶段：多模型入口与 Qwen3-30B-A3B 正确执行
 
-- [ ] 按模型配置注册和选择实现，替换固定的 Qwen3 构造入口
+- [x] 按模型配置注册和选择实现，替换固定的 Qwen3 构造入口
+- [x] 启用 `qwen3_moe` 注册项
+- [ ] 验证 MoE 模型创建与真实 checkpoint 加载
 - [ ] 保持 Dense Qwen3 的生成回归
-- [ ] 实现 MoE Router、Top-8 路由权重归一化、专家执行与输出合并
-- [ ] 适配 Router 与逐专家权重加载
+- [x] 实现 MoE Router、Top-8 路由权重归一化、专家执行与输出合并
+- [ ] 验证现有 loader 对 Router 与逐专家 checkpoint 权重的完整加载
 - [ ] 完成单卡浮点 Prefill / Decode，与参考实现对齐
 - [ ] 验证批量、Chunked Prefill、前缀缓存与抢占恢复
 
 ### 第二阶段：并行与效率
 
-- [ ] 明确 Attention、Router 和专家权重的 TP 分片策略
+- [x] 在代码中复用 Attention / 专家线性层 TP，Router 保持完整副本
 - [ ] 验证多卡数值与通信正确性
 - [ ] 评估 MoE dispatch、Grouped GEMM 与融合计算
 - [ ] 验证 MoE 执行路径的 CUDA Graph 兼容性
