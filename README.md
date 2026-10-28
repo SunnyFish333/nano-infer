@@ -26,7 +26,7 @@
   <a href="#contributing">参与贡献</a>
 </p>
 
-> **当前进度**：已接入按 `model_type` 选择模型的统一入口，注册 Qwen3 Dense 与 Qwen3 MoE，并实现 MoE 模型结构、Router 与逐专家计算。Qwen3-30B-A3B 尚未完成运行与数值验收。下方快速开始使用 Qwen3-0.6B。
+> **当前进度**：已注册 Qwen3 Dense 与 Qwen3 MoE，并实现 MoE Router 与逐专家计算；正在为 Qwen3.5 准备 Partial RoPE、交错 MRoPE 与 Norm 组件。Qwen3-30B-A3B 尚未完成运行与数值验收，Qwen3.5 尚未接入完整推理链路。下方快速开始使用 Qwen3-0.6B。
 
 <a id="about"></a>
 
@@ -51,6 +51,7 @@
 | --- | --- | --- | --- |
 | Qwen3-0.6B | Dense / GQA | 已有代码与示例入口 | 当前回归基线；本分支 GPU 验收待补充 |
 | Qwen3-30B-A3B | MoE / GQA | 模型结构与注册已接入，待运行验证 | 完整权重加载、生成与数值对齐待验证 |
+| Qwen3.5 Dense / MoE | 混合注意力 / 视觉语言模型 | 基础组件准备中 | 已新增位置编码与 Norm 组件；模型、视觉输入和状态缓存尚未接入 |
 | 其他模型 | 按架构扩展 | 后续规划 | 完成结构和权重审计后，再加入支持矩阵 |
 
 “已有代码”表示存在相应实现；只有提交可复现的数值和运行记录后，才标记为验证通过。同属 Qwen 系列，也不代表只替换模型路径即可运行。
@@ -81,6 +82,19 @@ MoE 已有模型实现，尚未作为验证通过的可用模型提供。EP、�
 - **验收待办**：验证模型创建、真实权重加载、Prefill / Decode logits、完整生成和缓存路径，再进行 TP 与性能验收。
 
 当前实现面向目标模型的 Top-8 与路由权重归一化配置；拓展到其他 MoE 配置前，还需处理 `top_k=1` 时 mask 的维度，以及按 `norm_topk_prob` 配置决定是否归一化。
+
+### Qwen3.5 基础组件进度
+
+以下为已添加的底层代码，尚未完成数值对齐，也不代表已经支持 Qwen3.5 生成：
+
+| 组件 | 当前实现 | 接入状态 |
+| --- | --- | --- |
+| Partial RoPE | `apply_rotary_emb()` 旋转前 `rotary_dim` 维，其余维度保留；普通 RoPE 允许旋转维度小于 head 维度 | 现有 Qwen3 模型仍传入完整 head 维度 |
+| 交错 MRoPE | `MRotaryEmbedding` 接收 `[3, N]` 的 T/H/W 位置，通过轴选择表和 `gather` 为各频率选择角度，再旋转 Q/K | 尚未接入模型；`get_rope()` 仍创建普通 RoPE |
+| 零中心 RMSNorm | `GemmaRMSNorm` 使用 `1 + weight` 缩放，权重初始化为零 | 已添加，待模型接入与精度验证 |
+| 门控 RMSNorm | `RMSNormGated` 在归一化与权重缩放后乘以 `SiLU(gate)` | 已添加，待 Gated DeltaNet 接入 |
+
+MRoPE 默认频率分配为 `(11, 11, 10)`，对应 64 个旋转维度；当前交错切片逻辑仍需补充参数校验和其他配置的覆盖验证。后续还需要实现 Gated DeltaNet 及其卷积/递推状态缓存、Gated Attention、模型配置与权重映射，以及图像/视频预处理、视觉编码器和多模态位置编号生成。
 
 ### 首个 MoE 目标：Qwen3-30B-A3B
 
@@ -214,7 +228,10 @@ nano-vllm/
     │   ├── registry.py        # 根据 model_type 选择模型实现
     │   ├── qwen3.py           # Dense Qwen3 架构
     │   └── qwen3_moe.py       # Qwen3 MoE 架构，已注册，待运行验收
-    ├── layers/                # 并行线性层、Attention、Norm、RoPE 等
+    ├── layers/
+    │   ├── rotary_embedding.py # RoPE、Partial RoPE 与交错 MRoPE 组件
+    │   ├── layernorm.py       # RMSNorm、零中心与门控 Norm 组件
+    │   └── ...               # 并行线性层、Attention、激活与采样等
     ├── engine/
     │   ├── llm_engine.py      # 请求生命周期
     │   ├── sequence.py        # 序列状态
@@ -268,6 +285,11 @@ nano-vllm/
 
 ### 后续方向
 
+- [x] 添加 Partial RoPE、交错 MRoPE、零中心 RMSNorm 与门控 RMSNorm 组件
+- [ ] 完成位置编码与 Norm 的参考实现数值对齐及边界检查
+- [ ] 接入 Qwen3.5 混合注意力语言骨干与状态缓存
+- [ ] 接入 Qwen3.5 视觉编码、图像/视频输入和多模态位置编号
+- [ ] 完成 Qwen3.5 Dense / MoE 权重加载、生成及缓存路径验证
 - [ ] 更多 Dense / MoE 架构
 - [ ] Expert Parallelism 与跨卡 token dispatch / combine
 - [ ] 权重量化、激活量化与专用计算内核
