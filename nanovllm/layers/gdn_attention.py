@@ -59,7 +59,7 @@ def torch_chunk_gated_delta_rule(
     total_sequence_length = sequence_length + pad_size
     num_chunks = total_sequence_length // chunk_size
 
-    # beta 是状态更新的"学习率"：0 = 不更新，1 = 完全覆写旧状态
+    # beta 控制 delta 修正强度；为 0 时不写入修正，但旧状态仍会衰减。
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
     query, key, k_beta, v_beta = [
@@ -178,9 +178,14 @@ class GDNAttention(nn.Module):
     ) -> None:
         super().__init__()
         assert dist.get_world_size() == 1, "GDN v1 requires tensor_parallel_size=1"
+        if num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
+            raise ValueError("num_v_heads must be a positive multiple of num_k_heads")
+        if conv_kernel_size < 1:
+            raise ValueError("conv_kernel_size must be positive")
         self.hidden_size = hidden_size
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
+        self.num_head_groups = num_v_heads // num_k_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.key_dim = head_k_dim * num_k_heads
@@ -214,18 +219,31 @@ class GDNAttention(nn.Module):
         z = self.in_proj_z(hidden_states)                    # [N, value_dim]
         b = self.in_proj_b(hidden_states)                    # [N, num_v_heads]
         a = self.in_proj_a(hidden_states)                    # [N, num_v_heads]
-        # log 域衰减，必须 fp32（bf16 下 exp(-A_log) 可能下溢为 0/NaN）
+        # 在 FP32 中计算 log 域衰减，保留指数和 softplus 运算的精度。
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         beta = b.sigmoid()
 
-        warmup = self.conv_pool.numel() == 0
-        if context.is_prefill or warmup:
+        # kernel_size=1 时卷积历史长度为 0，不能用 conv_pool.numel() 判断初始化。
+        warmup = self.ssm_pool.numel() == 0
+        if warmup and self.conv_pool.numel() != 0:
+            raise RuntimeError("GDN convolution and recurrent caches must be initialized together")
+        if warmup and not context.is_prefill:
+            raise RuntimeError("GDN decode requires initialized state caches; warmup supports prefill only")
+        if not warmup and context.gdn_slots is None:
+            raise RuntimeError("GDN execution requires context.gdn_slots")
+        if context.is_prefill:
+            if context.cu_seqlens_q is None:
+                raise RuntimeError("GDN prefill requires context.cu_seqlens_q")
             cu = context.cu_seqlens_q.tolist()
             if warmup:
                 slots, has_initial = [None] * (len(cu) - 1), [False] * (len(cu) - 1)
             else:
                 slots = context.gdn_slots.tolist()
                 has_initial = context.gdn_has_initial
+                if has_initial is None:
+                    raise RuntimeError("GDN prefill requires context.gdn_has_initial")
+                if len(slots) != len(cu) - 1 or len(has_initial) != len(slots):
+                    raise ValueError("GDN prefill metadata must contain one entry per sequence")
             core = torch.empty_like(z)
             for i, slot in enumerate(slots):
                 t0, t1 = cu[i], cu[i + 1]
@@ -253,17 +271,21 @@ class GDNAttention(nn.Module):
         if has_initial:
             win = torch.cat([self.conv_pool[slot], x], dim=-1)
         else:
-            win = F.pad(x, (0, 0, self.conv_kernel_size - 1, 0))
+            win = F.pad(x, (self.conv_kernel_size - 1, 0))
         conv_out = F.conv1d(win, self.conv1d.weight, groups=self.conv_dim)[:, -L:]
         conv_out = F.silu(conv_out)
         if slot is not None:
-            self.conv_pool[slot] = win[:, -(self.conv_kernel_size - 1):]
+            history_length = self.conv_kernel_size - 1
+            self.conv_pool[slot] = win[:, -history_length:] if history_length else win[:, :0]
 
         q, k, v = conv_out.transpose(0, 1).split(
             [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = q.reshape(L, self.num_k_heads, self.head_k_dim)[None]
         k = k.reshape(L, self.num_k_heads, self.head_k_dim)[None]
         v = v.reshape(L, self.num_v_heads, self.head_v_dim)[None]
+        if self.num_head_groups > 1:
+            q = q.repeat_interleave(self.num_head_groups, dim=2)
+            k = k.repeat_interleave(self.num_head_groups, dim=2)
 
         initial_state = self.ssm_pool[slot][None] if has_initial else None
         o, final_state = torch_chunk_gated_delta_rule(
@@ -274,7 +296,7 @@ class GDNAttention(nn.Module):
         )
         if slot is not None:
             self.ssm_pool[slot] = final_state[0]
-        return o[0]                                          # [L, value_dim]
+        return o[0].reshape(L, self.value_dim)                # [L, value_dim]
 
     def _decode_batch(
         self,
@@ -286,13 +308,17 @@ class GDNAttention(nn.Module):
         # conv 滚动更新：window = [旧 state(kernel-1 列) | 新 token]
         win = torch.cat([self.conv_pool[slots], mixed_qkv.unsqueeze(-1)], dim=-1)  # [B, conv_dim, kernel]
         conv_out = F.silu((win * self.conv1d.weight.squeeze(1)).sum(-1))           # [B, conv_dim]
-        self.conv_pool[slots] = win[..., -(self.conv_kernel_size - 1):]
+        history_length = self.conv_kernel_size - 1
+        self.conv_pool[slots] = win[..., -history_length:] if history_length else win[..., :0]
 
         B = mixed_qkv.size(0)
         q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = q.reshape(B, 1, self.num_k_heads, self.head_k_dim)
         k = k.reshape(B, 1, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, 1, self.num_v_heads, self.head_v_dim)
+        if self.num_head_groups > 1:
+            q = q.repeat_interleave(self.num_head_groups, dim=2)
+            k = k.repeat_interleave(self.num_head_groups, dim=2)
 
         # 高级索引 gather 出的已是拷贝，算完 scatter 回写，无原地别名问题
         initial_state = self.ssm_pool[slots]                 # [B, H, K, V] fp32
