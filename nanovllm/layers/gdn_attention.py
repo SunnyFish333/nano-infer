@@ -307,7 +307,10 @@ class GDNAttention(nn.Module):
     ) -> torch.Tensor:
         # conv 滚动更新：window = [旧 state(kernel-1 列) | 新 token]
         win = torch.cat([self.conv_pool[slots], mixed_qkv.unsqueeze(-1)], dim=-1)  # [B, conv_dim, kernel]
-        conv_out = F.silu((win * self.conv1d.weight.squeeze(1)).sum(-1))           # [B, conv_dim]
+        # FP32 乘加避免 BF16 中间乘积提前舍入；转回原 dtype 后再激活，与 prefill 对齐。
+        weight = self.conv1d.weight.squeeze(1)
+        conv_out = (win.float() * weight.float()).sum(-1).to(win.dtype)          # [B, conv_dim]
+        conv_out = F.silu(conv_out)
         history_length = self.conv_kernel_size - 1
         self.conv_pool[slots] = win[..., -history_length:] if history_length else win[..., :0]
 
