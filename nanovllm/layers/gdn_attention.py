@@ -210,7 +210,7 @@ class GDNAttention(nn.Module):
         self.norm = RMSNormGated(head_v_dim, eps=rms_norm_eps)   # per-head, weight [head_v_dim]
         self.out_proj = RowParallelLinear(self.value_dim, hidden_size, bias=False)
 
-        # 占位；model_runner 按线性层出现顺序注入 conv_cache[lid] / ssm_cache[lid]
+        # 占位；model_runner 按 GDN 层顺序绑定统一缓存张量的逐层视图。
         self.conv_pool = self.ssm_pool = torch.tensor([])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

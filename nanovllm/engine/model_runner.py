@@ -10,6 +10,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import build_model
 
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.gdn_attention import GDNAttention
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -18,7 +19,7 @@ class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
-        hf_config = config.hf_config
+        hf_config = config.text_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
@@ -31,11 +32,22 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
 
-        self.model = build_model(hf_config)
-        
+        # 完整模型构建需要顶层配置；语言计算参数从 text_config 读取。
+        self.model = build_model(config.hf_config)
+        self.gdn_layers = [module for module in self.model.modules() if isinstance(module, GDNAttention)]
+        config.has_gdn = bool(self.gdn_layers)
+        if config.has_gdn:
+            if self.world_size != 1:
+                raise ValueError("GDN state scheduling v1 requires tensor_parallel_size=1")
+            self.enforce_eager = config.enforce_eager = True
+
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
+        # 在分配持久状态池之前记录预热的临时显存，避免后续峰值掩盖工作区需求。
+        self.workspace_bytes = max(0, torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+                                   - torch.cuda.memory_stats()["allocated_bytes.all.current"])
+        self.allocate_gdn_cache()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -104,25 +116,73 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
+    def allocate_gdn_cache(self):
+        self.conv_cache = None
+        self.ssm_cache = None
+        if not self.gdn_layers:
+            return
+        capacity = self.config.num_gdn_slots
+        num_layers = len(self.gdn_layers)
+        first_layer = self.gdn_layers[0]
+        conv_shape = (capacity, first_layer.conv_dim, first_layer.conv_kernel_size - 1)
+        ssm_shape = (capacity, first_layer.num_v_heads, first_layer.head_k_dim, first_layer.head_v_dim)
+        conv_dtype = first_layer.conv1d.weight.dtype
+        if any(
+            (capacity, layer.conv_dim, layer.conv_kernel_size - 1) != conv_shape
+            or (capacity, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim) != ssm_shape
+            or layer.conv1d.weight.dtype != conv_dtype
+            for layer in self.gdn_layers
+        ):
+            raise ValueError("GDN layers must have matching state shapes and convolution dtypes")
+        required_bytes = num_layers * capacity * (
+            first_layer.conv_dim * (first_layer.conv_kernel_size - 1) * first_layer.conv1d.weight.element_size()
+            + first_layer.num_v_heads * first_layer.head_k_dim * first_layer.head_v_dim * 4
+        )
+        free, total = torch.cuda.mem_get_info()
+        budget = int(total * self.config.gpu_memory_utilization) - (total - free) - self.workspace_bytes
+        if required_bytes > budget:
+            raise RuntimeError("GDN state pool exceeds the memory budget; reduce num_gdn_slots")
+        # 与 KV cache 一样，统一按 [层, ...] 开辟；各层持有对应切片的视图。
+        self.conv_cache = torch.zeros(num_layers, *conv_shape, dtype=conv_dtype, device="cuda")
+        self.ssm_cache = torch.zeros(num_layers, *ssm_shape, dtype=torch.float32, device="cuda")
+        for layer_id, layer in enumerate(self.gdn_layers):
+            layer.conv_pool = self.conv_cache[layer_id]
+            layer.ssm_pool = self.ssm_cache[layer_id]
+
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
+        attention_layers = [module for module in self.model.modules()
+                            if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
+        if not attention_layers:
+            raise ValueError("This scheduler requires at least one full-attention layer")
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        num_layers = len(attention_layers)
+        num_kv_heads = attention_layers[0].num_kv_heads
+        head_dim = attention_layers[0].head_dim
+        if any(layer.num_kv_heads != num_kv_heads or layer.head_dim != head_dim for layer in attention_layers):
+            raise ValueError("Full-attention layers must have matching KV head layouts")
+        dtype = torch.get_default_dtype()
+        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * dtype.itemsize
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - self.workspace_bytes) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks, self.block_size,
+                                    num_kv_heads, head_dim, dtype=dtype, device="cuda")
+        for layer_id, module in enumerate(attention_layers):
+            module.k_cache = self.kv_cache[0, layer_id]
+            module.v_cache = self.kv_cache[1, layer_id]
+
+    def prepare_gdn_context(self, seqs: list[Sequence], is_prefill: bool):
+        if not self.gdn_layers or self.gdn_layers[0].ssm_pool.numel() == 0:
+            return None, None  # 无 GDN，或尚未分配状态池的 prefill 预热。
+        for seq in seqs:
+            assert 0 <= seq.gdn_slot < self.config.num_gdn_slots
+            assert seq.num_gdn_cached_tokens == seq.num_cached_tokens
+            if not is_prefill:
+                assert seq.num_gdn_cached_tokens == len(seq) - 1
+        slots = torch.tensor([seq.gdn_slot for seq in seqs], dtype=torch.int64,
+                             pin_memory=True, device="cpu").cuda(non_blocking=True)
+        return slots, [seq.num_gdn_cached_tokens > 0 for seq in seqs]
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -170,7 +230,9 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        gdn_slots, gdn_has_initial = self.prepare_gdn_context(seqs, True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    gdn_slots=gdn_slots, gdn_has_initial=gdn_has_initial)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -188,7 +250,9 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        gdn_slots, gdn_has_initial = self.prepare_gdn_context(seqs, False)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    gdn_slots=gdn_slots, gdn_has_initial=gdn_has_initial)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -226,7 +290,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        hf_config = config.hf_config
+        hf_config = config.text_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
