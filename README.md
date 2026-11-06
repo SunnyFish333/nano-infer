@@ -28,7 +28,7 @@ Nano-Infer 基于 [Nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)，在
 ## 功能
 
 - **生成与调度**：离线批量生成，支持文本或 token ID 输入、Prefill 优先调度与 Chunked Prefill。
-- **缓存管理**：分页 KV Cache、前缀复用与缓存不足时的请求抢占。
+- **缓存管理**：分页 KV Cache、前缀复用、GDN 状态槽位与缓存不足时的请求抢占重算。
 - **GPU 执行**：单机张量并行、合并投影、FlashAttention、Triton KV 写入与 Decode CUDA Graph。
 - **模型扩展**：按 Hugging Face 配置中的 `model_type` 注册和选择架构实现。
 
@@ -40,35 +40,63 @@ Nano-Infer 基于 [Nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)，在
 | --- | --- | --- |
 | Qwen3-0.6B | 基线实现 | 包含架构、权重加载与生成示例；待补充分支回归记录 |
 | Qwen3-30B-A3B | 已接入，待验证 | MoE 架构已注册；待验证真实权重加载、生成与数值一致性 |
-| Qwen3.5 Dense / MoE | 组件开发中 | 已添加位置编码、Norm 与门控投影；完整模型尚未接入 |
+| Qwen3.5 Dense（优先验证 0.8B） | 语言骨干已接入，待验证 | 已注册混合 Decoder、Gated Full Attention、GDN、Interleaved MRoPE 与状态调度；待真实权重和 GPU 验证 |
+| Qwen3.5 MoE / 视觉输入 | 尚未实现 | 配置已区分语言与视觉部分；专家结构、视觉编码器及图片请求链路待接入 |
 
-上表区分代码接入与运行验证；Qwen3.5 尚不提供完整推理入口。
+上表区分代码接入与运行验证，不代表已完成端到端正确性或性能验证。
 
 当前 Qwen3 MoE 采用 TP，尚不包含 EP；验证时需设置 `enforce_eager=True`，关闭暂不兼容的 CUDA Graph 路径。
+
+Qwen3.5 Dense 第一版仅支持单 GPU，自动使用 eager 执行并关闭跨请求前缀复用；GDN 状态按请求分配槽位，在结束或抢占时回收。当前骨干可接收预计算图像特征，但没有图片预处理、视觉编码器和多模态位置生成，尚不能直接输入图片。暂不支持量化、CPU offload 或 MTP。
 
 <a id="quickstart"></a>
 
 ## 快速开始
 
-运行环境：Linux、NVIDIA GPU、兼容的 CUDA 与驱动，以及 Python 3.10–3.12。依赖见 [pyproject.toml](pyproject.toml)；当前未提供锁定版本的环境文件。
+运行环境：Linux、NVIDIA GPU、兼容的 CUDA 与驱动，以及 Python 3.10–3.12，建议开发环境使用 Python 3.11。Windows 用户可使用 WSL2 + Ubuntu，在 Linux 内独立安装 Python 和依赖；WSL 使用 Windows 提供的 GPU 驱动，CUDA Toolkit 与 Python 环境分别管理。
+
+依赖见 [pyproject.toml](pyproject.toml)。当前未提供经过完整验证的版本锁定文件，其中的最低版本也不保证支持 Qwen3.5；需确认所选 Transformers 能识别目标 checkpoint 的配置。
 
 ### 安装
 
 ```bash
+mkdir -p ~/projects
+cd ~/projects
 git clone https://github.com/SunnyFish333/nano-infer.git
 cd nano-infer
 ```
 
-在独立 Python 环境中安装与设备匹配的 [CUDA 版 PyTorch](https://pytorch.org/get-started/locally/)，确认 `torch.cuda.is_available()` 返回 `True`，然后执行：
+建议为本项目创建独立环境。在已安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 的 Linux / WSL 中：
 
 ```bash
-python -m pip install packaging ninja
+uv python install 3.11
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install pip
+```
+
+也可以使用已有 Python 3.11 的 `venv` 或 Conda 环境。安装与 GPU 和驱动匹配的 [CUDA 版 PyTorch](https://pytorch.org/get-started/locally/)，再安装其余依赖：
+
+```bash
+python -m pip install packaging ninja numpy tqdm safetensors
 python -m pip install flash-attn --no-build-isolation
 python -m pip install -e .
 python -m pip install huggingface_hub
 ```
 
 FlashAttention 的硬件与构建要求见其[安装说明](https://github.com/Dao-AILab/flash-attention#installation-and-features)。
+
+安装后检查：
+
+```bash
+nvidia-smi
+nvcc --version
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "import transformers, triton, flash_attn; print(transformers.__version__, triton.__version__, flash_attn.__version__)"
+python -m pip check
+```
+
+`nvidia-smi` 的 CUDA 信息表示驱动支持能力，`nvcc` 表示 Toolkit 版本，`torch.version.cuda` 表示 PyTorch 的构建运行时版本。编译 FlashAttention 时还需匹配 Toolkit，并确保 `nvcc` 可通过 `PATH` 找到；仅确认 GPU 可见并不足以验证完整环境。
 
 ### 运行
 
@@ -112,6 +140,31 @@ if __name__ == "__main__":
 
 每条结果包含 `text` 和 `token_ids`。当前采样器要求 `temperature > 1e-10`，不支持通过 `temperature=0` 启用贪心采样。
 
+### Qwen3.5 开发验证
+
+语言骨干可使用完整 Qwen3.5 Dense checkpoint 的语言权重，加载时明确跳过视觉和 MTP 分支。以下是待 GPU 验证的低并发起步配置，并非显存或运行成功的保证：
+
+```bash
+hf download Qwen/Qwen3.5-0.8B --local-dir "$HOME/huggingface/Qwen3.5-0.8B"
+```
+
+在上面的生成示例中改用该模型目录，并将 `LLM` 初始化替换为：
+
+```python
+llm = LLM(
+    path,
+    tensor_parallel_size=1,
+    enforce_eager=True,
+    max_num_seqs=1,
+    num_gdn_slots=2,
+    max_model_len=1024,
+    max_num_batched_tokens=256,
+    gpu_memory_utilization=0.7,
+)
+```
+
+`max_num_seqs` 限制单轮调度请求数，`num_gdn_slots` 限制同时保留 GDN 状态的请求数。增加槽位会增加固定状态池显存；应先完成单请求纯文本验证，再扩大上下文和并发。
+
 <a id="architecture"></a>
 
 ## 代码结构
@@ -119,11 +172,12 @@ if __name__ == "__main__":
 | 路径 | 职责 |
 | --- | --- |
 | `nanovllm/models/` | 模型注册、架构定义与权重映射 |
-| `nanovllm/layers/` | 并行线性层、Attention、Norm、位置编码与采样 |
-| `nanovllm/engine/` | 请求生命周期、调度、缓存管理与 GPU 执行 |
+| `nanovllm/layers/` | 并行线性层、Full Attention、GDN、Norm、位置编码与采样 |
+| `nanovllm/engine/` | 请求生命周期、调度、KV 块与 GDN 槽位管理、GPU 执行 |
 | `nanovllm/utils/` | 权重加载与执行上下文 |
 | `example.py` | 离线生成示例 |
 | `bench.py` | 批量生成吞吐量测试 |
+| `tests/` | 配置、调度、骨干与权重加载测试 |
 
 模型实现组合通用层，并提供 `forward()` 与 `compute_logits()`。新增架构通过 `models/registry.py` 注册；输入协议、缓存布局或状态管理变化时，需要同步适配引擎。
 
@@ -132,10 +186,12 @@ if __name__ == "__main__":
 ## 开发计划
 
 - 完成 Qwen3 Dense 回归，以及 Qwen3 MoE 的权重加载、数值和 TP 验证。
-- 实现 Qwen3.5 Gated DeltaNet、混合层状态管理与模型接入，再推进视觉输入支持。
+- 完成 Qwen3.5 Dense 真实权重加载、logits 对齐、分块与逐步生成一致性验证，再推进 MoE 和视觉输入支持。
 - 在正确性验证后优化专家计算、CUDA Graph 和端到端性能。
 
 欢迎提交模型适配、正确性修复与性能优化。新增模型请附目标 checkpoint、权重映射和复现步骤；性能改动请同时提供数值验证与相同负载下的对照结果。
+
+在安装完整项目依赖后执行 `python -m unittest discover -s tests -v`。当前已进行使用依赖替身的 CPU 配置和调度检查；PyTorch 骨干测试、真实权重及 CUDA 执行仍待验证，跳过的测试不计为通过。
 
 <a id="benchmark"></a>
 
