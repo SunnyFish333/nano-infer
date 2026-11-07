@@ -33,7 +33,7 @@ class RMSNorm(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
         x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        residual = x.to(orig_dtype, copy=True)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
@@ -44,10 +44,16 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Use one rank/layout for hidden states and the strided Q/K views.
+        # Otherwise warmup, graph capture and decode can exhaust Dynamo's
+        # recompilation limit and fall back to a different numerical path.
+        shape = x.shape
+        x = x.reshape(-1, shape[-1]).contiguous()
         if residual is None:
-            return self.rms_forward(x)
-        else:
-            return self.add_rms_forward(x, residual)
+            return self.rms_forward(x).reshape(shape)
+        residual = residual.expand(shape).reshape(-1, shape[-1]).contiguous()
+        output, residual = self.add_rms_forward(x, residual)
+        return output.reshape(shape), residual.reshape(shape)
 
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
@@ -87,7 +93,9 @@ class GemmaRMSNorm(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
         x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        # FP32 conversion alone aliases x; normalization must not change the
+        # returned residual sum. BF16/FP16 conversion already needs a copy.
+        residual = x.to(orig_dtype, copy=True)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(weight.dtype).mul_(weight)
@@ -98,11 +106,17 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward()."""
+        # Keep the compiled kernels' rank and layout consistent for hidden
+        # states and the strided Q / contiguous K head tensors.
+        shape = x.shape
+        x = x.reshape(-1, shape[-1]).contiguous()
         weight = self.weight.float() + 1.0
         if residual is None:
-            return self.rms_forward(x, weight)
-        return self.add_rms_forward(x, residual, weight)
+            return self.rms_forward(x, weight).reshape(shape)
+        # Preserve the residual broadcasting supported by the original add.
+        residual = residual.expand(shape).reshape(-1, shape[-1]).contiguous()
+        output, residual = self.add_rms_forward(x, residual, weight)
+        return output.reshape(shape), residual.reshape(shape)
 
 class RMSNormGated(nn.Module):
     def __init__(

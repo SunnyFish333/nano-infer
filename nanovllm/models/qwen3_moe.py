@@ -173,7 +173,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         for expert_idx in expert_hitted:
             expert_idx = expert_idx.item()
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            # Keep [top_k, tokens] two-dimensional, including top_k == 1.
+            idx, top_x = torch.where(expert_mask[expert_idx])
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)

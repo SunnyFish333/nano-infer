@@ -280,12 +280,13 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+        try:
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill)
+            return self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        finally:
+            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -299,7 +300,9 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Always cover the configured maximum, including limits such as 10/17.
+        candidates = [1, 2, 4, 8, max_bs] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = sorted({bs for bs in candidates if 1 <= bs <= max_bs})
         self.graphs = {}
         self.graph_pool = None
 
