@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,7 @@ authors = [{ name = "Xingkai Yu" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "A lightweight multi-model LLM inference engine based on nano-vllm"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -17,11 +17,36 @@ dependencies = [
     "transformers>=4.51.0",
     "flash-attn",
     "xxhash",
+    "numpy",
+    "safetensors",
+    "tqdm",
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/SunnyFish333/nano-infer"
+Upstream="https://github.com/GeeeekExplorer/nano-vllm"
+
+[project.optional-dependencies]
+test = ["pytest>=9,<10", "pytest-cov>=6,<8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --import-mode=importlib"
+markers = [
+    "unit: isolated component checks",
+    "integration: component interactions without production weights",
+    "e2e: complete model execution with local checkpoints",
+    "gpu: real CUDA tests, enabled by default; excluded with --cpu-only",
+    "weights: requires --run-weights and explicit local model paths",
+    "distributed: requires --run-distributed and multiple CUDA devices",
+    "compile: isolated torch.compile regression, enabled by default with CUDA",
+    "slow: longer-running checks",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.coverage.report]
+include_namespace_packages = true
