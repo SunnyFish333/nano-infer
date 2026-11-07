@@ -193,3 +193,29 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local validation outputs.
+.test-artifacts/
+test-results/
+.local-setup/
+logs/
+
+# Local environment overrides; keep sanitized examples versioned.
+.env.*
+!.env.example
+!.env.sample
+
+# Local-only tests, experiments and internal documentation.
+/test/
+/tests/
+/test-result/
+/test-results/
+/test_result/
+/test_results/
+/benchmark/
+/benchmarks/
+/DEVELOPMENT.md
+/ENVIRONMENT.md
+/QWEN3_5_ADAPTATION_PLAN.md
+# The test workflow depends on local-only test sources.
+/.github/workflows/tests.yml
