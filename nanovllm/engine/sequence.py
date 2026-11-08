@@ -31,6 +31,23 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.position_ids = None  # CPU [3,prompt_length]; tensors stay on the owner process.
+        self.rope_delta = 0
+
+    def positions(self, start, end):
+        """Slice original prompt positions and reconstruct generated text after preemption."""
+        import torch
+        if getattr(self, "position_ids", None) is None:
+            return torch.arange(start, end, dtype=torch.long, device="cpu")
+        prompt_end = min(end, self.num_prompt_tokens)
+        parts = []
+        if start < prompt_end:
+            parts.append(self.position_ids[:, start:prompt_end])
+        if end > self.num_prompt_tokens:
+            generated_start = max(start, self.num_prompt_tokens)
+            parts.append((torch.arange(generated_start, end, device="cpu")
+                          + self.rope_delta)[None].expand(3, -1))
+        return torch.cat(parts, dim=1)
 
     def __len__(self):
         return self.num_tokens

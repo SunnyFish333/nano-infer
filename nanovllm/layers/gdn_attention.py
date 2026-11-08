@@ -266,6 +266,9 @@ class GDNAttention(nn.Module):
         has_initial: bool,
     ) -> torch.Tensor:
         L = mixed_qkv.size(0)
+        if has_initial and L == 1:
+            slots = torch.tensor([slot], device=mixed_qkv.device, dtype=torch.long)
+            return self._decode_batch(mixed_qkv, g, beta, slots)
         x = mixed_qkv.transpose(0, 1)                        # [conv_dim, L]
         # 分组因果卷积：历史窗口(未卷积的输入尾部 kernel-1 列) + 新 token
         if has_initial:

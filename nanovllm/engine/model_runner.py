@@ -25,34 +25,45 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.visual_requests = {}
+        self.visual_cpu_bytes = 0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
-
-        # 完整模型构建需要顶层配置；语言计算参数从 text_config 读取。
-        self.model = build_model(config.hf_config)
-        self.gdn_layers = [module for module in self.model.modules() if isinstance(module, GDNAttention)]
-        config.has_gdn = bool(self.gdn_layers)
-        if config.has_gdn:
-            if self.world_size != 1:
-                raise ValueError("GDN state scheduling v1 requires tensor_parallel_size=1")
-            self.enforce_eager = config.enforce_eager = True
-
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        # 在分配持久状态池之前记录预热的临时显存，避免后续峰值掩盖工作区需求。
-        self.workspace_bytes = max(0, torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-                                   - torch.cuda.memory_stats()["allocated_bytes.all.current"])
-        self.allocate_gdn_cache()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        default_device = torch.get_default_device()
+        try:
+            torch.set_default_dtype(hf_config.dtype)
+            torch.set_default_device("cuda")
+            # Build the complete model; decoder dimensions come from text_config.
+            hf_config.reference_numerics = getattr(config, "reference_numerics", False)
+            if getattr(config, "vision_config", None) is not None:
+                config.vision_config.reference_numerics = hf_config.reference_numerics
+            self.model = build_model(config.hf_config)
+            self.model.eval()
+            self.gdn_layers = [module for module in self.model.modules() if isinstance(module, GDNAttention)]
+            config.has_gdn = bool(self.gdn_layers)
+            if config.has_gdn:
+                if self.world_size != 1:
+                    raise ValueError("GDN state scheduling v1 requires tensor_parallel_size=1")
+                self.enforce_eager = config.enforce_eager = True
+            load_model(self.model, config.model)
+            self.sampler = Sampler()
+            self.warmup_model()
+            self.workspace_bytes = max(0, torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+                                       - torch.cuda.memory_stats()["allocated_bytes.all.current"])
+            self.warmup_vision()
+            self.allocate_gdn_cache()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        except BaseException:
+            reset_context()
+            dist.destroy_process_group()
+            raise
+        finally:
+            torch.set_default_device(str(default_device))
+            torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
@@ -64,6 +75,8 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
+        self.visual_requests.clear()
+        self.visual_cpu_bytes = 0
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -73,6 +86,13 @@ class ModelRunner:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
+        # Linear parameters carry bound loader methods, so model objects can form
+        # cycles. Release pools and collect them before constructing another engine.
+        for name in ("model", "gdn_layers", "kv_cache", "conv_cache", "ssm_cache"):
+            self.__dict__.pop(name, None)
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def loop(self):
         while True:
@@ -115,6 +135,77 @@ class ModelRunner:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def warmup_vision(self):
+        vision = getattr(getattr(self.model, "model", None), "visual", None)
+        if vision is None:
+            return
+        cfg = vision.config
+        merge = cfg.spatial_merge_size
+        patches = max(merge**2, self.config.max_image_pixels // cfg.patch_size**2)
+        h, w = merge, max(merge, patches // merge // merge * merge)
+        pixels = torch.zeros(h*w, cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2,
+                             device="cuda", dtype=vision.patch_embed.proj.weight.dtype)
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        self.model.encode_vision(pixels, torch.tensor([[1, h, w]], device="cpu"))
+        torch.cuda.synchronize()
+        # Visual features are staged per step; reserve both encoder and transfer space.
+        vision_peak = torch.cuda.max_memory_allocated() - before + pixels.numel()*pixels.element_size()
+        feature_bytes = (self.config.max_num_batched_tokens * self.config.text_config.hidden_size
+                         * vision.patch_embed.proj.weight.element_size())
+        self.workspace_bytes = max(self.workspace_bytes, vision_peak + feature_bytes + 32*1024**2)
+        del pixels
+        torch.cuda.empty_cache()
+
+    def register_visual(self, seq_id, items):
+        size = sum(item.pixel_values.numel()*item.pixel_values.element_size() for item in items)
+        # Account for feature storage before encoding so requests cannot overcommit CPU memory.
+        hidden = self.config.text_config.hidden_size
+        dtype_bytes = (self.model.lm_head.weight.element_size()
+                       if hasattr(self.model, "lm_head") else 2)
+        size += sum((item.end-item.start)*hidden*dtype_bytes for item in items)
+        if self.visual_cpu_bytes + size > self.config.vision_cpu_cache_mb * 1024**2:
+            raise ValueError("Visual request data exceeds vision_cpu_cache_mb")
+        self.visual_requests[seq_id] = (items, {}, size)
+        self.visual_cpu_bytes += size
+
+    def release_visual(self, seq_ids):
+        for seq_id in seq_ids:
+            value = self.visual_requests.pop(seq_id, None)
+            if value is not None:
+                self.visual_cpu_bytes -= value[2]
+
+    @torch.inference_mode()
+    def prepare_visual_inputs(self, seqs, is_prefill):
+        if not is_prefill:
+            return None
+        features, indices, base = [], [], 0
+        for seq in seqs:
+            start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
+            entry = self.visual_requests.get(seq.seq_id)
+            if entry is not None:
+                items, cache, _ = entry
+                for index, item in enumerate(items):
+                    left, right = max(start, item.start), min(end, item.end)
+                    if left >= right:
+                        continue
+                    if index not in cache:
+                        device = self.model.model.visual.patch_embed.proj.weight.device
+                        output = self.model.encode_vision(item.pixel_values.to(device),
+                                    torch.tensor([item.grid_thw], device="cpu"))
+                        if output.shape != (item.end-item.start, self.config.text_config.hidden_size):
+                            raise ValueError("Vision features do not match placeholder interval")
+                        cache[index] = output.cpu()
+                    features.append(cache[index][left-item.start:right-item.start])
+                    indices.extend(range(base+left-start, base+right-start))
+            base += end-start
+        if not features:
+            return None
+        mask = torch.zeros(base, dtype=torch.bool, device="cuda")
+        mask[torch.tensor(indices, device="cuda")] = True
+        return torch.cat(features).cuda(), mask
 
     def allocate_gdn_cache(self):
         self.conv_cache = None
@@ -205,7 +296,7 @@ class ModelRunner:
             end = start + seqlen_q
             seqlen_k = end
             input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
+            positions.append(seq.positions(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -226,7 +317,9 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if any(pos.ndim == 2 for pos in positions):
+            positions = [pos if pos.ndim == 2 else pos[None].expand(3, -1) for pos in positions]
+        positions = torch.cat(positions, dim=-1).pin_memory().cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -242,11 +335,13 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            positions.append(seq.positions(len(seq)-1, len(seq)))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if any(pos.ndim == 2 for pos in positions):
+            positions = [pos if pos.ndim == 2 else pos[None].expand(3, -1) for pos in positions]
+        positions = torch.cat(positions, dim=-1).pin_memory().cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
@@ -261,9 +356,10 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, visual=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            hidden = self.model(input_ids, positions, *visual) if visual is not None else self.model(input_ids, positions)
+            return self.model.compute_logits(hidden)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -281,9 +377,11 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         try:
+            visual = self.prepare_visual_inputs(seqs, is_prefill) if getattr(self, "visual_requests", None) else None
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-            logits = self.run_model(input_ids, positions, is_prefill)
+            logits = (self.run_model(input_ids, positions, is_prefill, visual)
+                      if visual is not None else self.run_model(input_ids, positions, is_prefill))
             return self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         finally:
             reset_context()

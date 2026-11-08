@@ -4,11 +4,13 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.gdn_state_manager import GDNStateManager
+from nanovllm.engine.observer import emit
 
 
 class Scheduler:
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, observer=None):
+        self.observer = observer
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
@@ -24,6 +26,31 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+
+    def abort(self, seq):
+        """Discard a failed/cancelled request and all decoder state references."""
+        for queue in (self.waiting, self.running):
+            if seq in queue:
+                queue.remove(seq)
+        self.block_manager.deallocate(seq)
+        if self.gdn_state_manager:
+            self.gdn_state_manager.deallocate(seq)
+        seq.num_scheduled_tokens = 0
+        seq.status = SequenceStatus.FINISHED
+
+    def observe_resources(self, seq=None, reason="snapshot"):
+        if self.observer is None:
+            return
+        manager = self.block_manager
+        slots = self.gdn_state_manager
+        payload = dict(reason=reason, used_blocks=len(manager.used_block_ids),
+                       free_blocks=len(manager.free_block_ids),
+                       used_slots=len(slots.used_slots) if slots else 0,
+                       total_slots=len(slots.used_slots) + len(slots.free_slots) if slots else 0)
+        if seq is not None:
+            payload.update(seq_id=seq.seq_id, assigned_blocks=len(seq.block_table),
+                           cached_tokens=seq.num_cached_tokens, gdn_slot=seq.gdn_slot)
+        emit(self.observer, "resource", **payload)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
@@ -50,6 +77,7 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
                 if self.gdn_state_manager:
                     self.gdn_state_manager.allocate(seq)
+                self.observe_resources(seq, "allocate")
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -74,6 +102,7 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
+                self.observe_resources(seq, "append")
                 scheduled_seqs.append(seq)
         if not scheduled_seqs:
             if self.waiting and not self.running:
@@ -88,6 +117,15 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        # Internal decode scheduling has already popped seq; explicit preemption
+        # must also detach it before re-enqueueing to avoid duplicate execution.
+        if seq in self.running:
+            self.running.remove(seq)
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        if self.observer is not None:
+            emit(self.observer, "preempt", seq_id=seq.seq_id,
+                 cached_tokens=seq.num_cached_tokens)
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
@@ -95,6 +133,7 @@ class Scheduler:
             self.gdn_state_manager.deallocate(seq)
         seq.num_scheduled_tokens = 0
         self.waiting.appendleft(seq)
+        self.observe_resources(seq, "preempt_release")
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
@@ -105,12 +144,20 @@ class Scheduler:
                 seq.num_gdn_cached_tokens += seq.num_scheduled_tokens
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
+            self.observe_resources(seq, "computed")
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
+            if self.observer is not None:
+                emit(self.observer, "token_ready", seq_id=seq.seq_id, token_id=token_id,
+                     phase="prefill" if is_prefill else "decode")
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 if self.gdn_state_manager:
                     self.gdn_state_manager.deallocate(seq)
                 self.running.remove(seq)
+                self.observe_resources(seq, "finish_release")
+                if self.observer is not None:
+                    emit(self.observer, "request_finished", seq_id=seq.seq_id,
+                         reason="eos" if not seq.ignore_eos and token_id == self.eos else "length")
