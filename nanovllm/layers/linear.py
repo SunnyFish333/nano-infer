@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from nanovllm.utils.loader import default_weight_loader, validate_weight_shape
 
 
 def divide(numerator, denominator):
@@ -45,7 +46,7 @@ class ReplicatedLinear(LinearBase):
         super().__init__(input_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
+        default_weight_loader(param, loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
@@ -64,10 +65,13 @@ class ColumnParallelLinear(LinearBase):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
+        expected = list(param.shape)
+        expected[self.tp_dim] *= self.tp_size
+        validate_weight_shape(loaded_weight, expected)
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        default_weight_loader(param_data, loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
@@ -85,12 +89,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         super().__init__(input_size, sum(output_sizes), bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        if type(loaded_shard_id) is not int or not 0 <= loaded_shard_id < len(self.output_sizes):
+            raise ValueError("Invalid merged projection shard ID")
+        expected = list(param.shape)
+        expected[self.tp_dim] = self.output_sizes[loaded_shard_id]
+        validate_weight_shape(loaded_weight, expected)
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)
+        default_weight_loader(param_data, loaded_weight)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -116,7 +125,8 @@ class QKVParallelLinear(ColumnParallelLinear):
  
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
-        assert loaded_shard_id in ["q", "k", "v"]
+        if loaded_shard_id not in ("q", "k", "v"):
+            raise ValueError("Invalid QKV projection shard ID")
         if loaded_shard_id == "q":
             shard_size = self.q_scale * self.num_heads * self.head_size #
             shard_offset = 0
@@ -126,9 +136,12 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.q_scale * self.num_heads * self.head_size + self.num_kv_heads * self.head_size #
+        expected = list(param.shape)
+        expected[self.tp_dim] = shard_size * self.tp_size
+        validate_weight_shape(loaded_weight, expected)
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)
+        default_weight_loader(param_data, loaded_weight)
 
 
 class RowParallelLinear(LinearBase):
@@ -145,12 +158,15 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if param_data.ndim == 1:
-            param_data.copy_(loaded_weight)
+            default_weight_loader(param_data, loaded_weight)
             return
+        expected = list(param.shape)
+        expected[self.tp_dim] *= self.tp_size
+        validate_weight_shape(loaded_weight, expected)
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        default_weight_loader(param_data, loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
