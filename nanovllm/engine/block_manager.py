@@ -34,12 +34,59 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1, extra_keys: tuple[bytes, ...] = ()):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
         h.update(np.array(token_ids).tobytes())
+        for key in extra_keys:
+            h.update(len(key).to_bytes(8, "little"))
+            h.update(key)
         return h.intdigest()
+
+    def get_prefix_key(self, seq: Sequence, num_tokens: int) -> tuple[int, int]:
+        if num_tokens <= 0 or num_tokens % self.block_size or num_tokens > len(seq):
+            raise ValueError("Prefix key requires a positive, complete token boundary")
+        count = num_tokens // self.block_size
+        while len(seq.prefix_hashes) < count:
+            i = len(seq.prefix_hashes)
+            parent = seq.prefix_hashes[-1] if i else -1
+            seq.prefix_hashes.append(self.compute_hash(seq.block(i), parent))
+        return seq.prefix_hashes[count - 1], num_tokens
+
+    def find_prefix_blocks(self, seq: Sequence) -> tuple[int, ...]:
+        if not self.enable_prefix_cache or not seq.prefix_cacheable:
+            return ()
+        found = []
+        for i in range(seq.num_blocks - 1):
+            h, _ = self.get_prefix_key(seq, (i + 1) * self.block_size)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != seq.block(i):
+                break
+            found.append(block_id)
+        return tuple(found)
+
+    def can_allocate_with_prefix(self, seq: Sequence, block_ids: tuple[int, ...]) -> bool:
+        used = sum(self.blocks[i].ref_count > 0 for i in block_ids)
+        return len(self.free_block_ids) >= seq.num_blocks - used
+
+    def allocate_with_prefix(self, seq: Sequence, block_ids: tuple[int, ...]):
+        assert not seq.block_table
+        if not self.can_allocate_with_prefix(seq, block_ids):
+            raise RuntimeError("Insufficient KV blocks for selected prefix")
+        # Protect all hits before allocating blocks that may evict idle cache entries.
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            if block.ref_count:
+                block.ref_count += 1
+            else:
+                self.free_block_ids.remove(block_id)
+                self.used_block_ids.add(block_id)
+                block.ref_count = 1
+            seq.block_table.append(block_id)
+        for _ in range(len(block_ids), seq.num_blocks):
+            seq.block_table.append(self._allocate_block())
+        seq.num_cached_tokens = len(block_ids) * self.block_size
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
@@ -57,42 +104,14 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
-        if not self.enable_prefix_cache:
-            return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
-        h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+        blocks = self.find_prefix_blocks(seq)
+        return len(blocks) if self.can_allocate_with_prefix(seq, blocks) else -1
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
-        assert not seq.block_table
-        h = -1
-        for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
-            block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                block.ref_count = 1
-                self.free_block_ids.remove(block_id)
-                self.used_block_ids.add(block_id)
-            seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
-            seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        blocks = self.find_prefix_blocks(seq)[:num_cached_blocks] if num_cached_blocks else ()
+        if len(blocks) != num_cached_blocks:
+            raise RuntimeError("Selected KV prefix is no longer available")
+        self.allocate_with_prefix(seq, blocks)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -111,15 +130,14 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
-        if not self.enable_prefix_cache:
+        if not self.enable_prefix_cache or not seq.prefix_cacheable:
             return
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
         if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h, _ = self.get_prefix_key(seq, (i + 1) * self.block_size)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id

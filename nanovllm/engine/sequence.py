@@ -28,6 +28,8 @@ class Sequence:
         self.block_table = []
         self.gdn_slot = -1
         self.num_gdn_cached_tokens = 0
+        self.prefix_cacheable = True
+        self.prefix_hashes: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos

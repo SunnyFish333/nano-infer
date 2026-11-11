@@ -197,6 +197,7 @@ cython_debug/
 # Local validation outputs.
 .test-artifacts/
 test-results/
+benchmark-result/
 .local-setup/
 logs/
 
@@ -217,5 +218,6 @@ logs/
 /DEVELOPMENT.md
 /ENVIRONMENT.md
 /QWEN3_5_ADAPTATION_PLAN.md
+/GDN_PREFIX_CACHING_PLAN.md
 # The test workflow depends on local-only test sources.
 /.github/workflows/tests.yml

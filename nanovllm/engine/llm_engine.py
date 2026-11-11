@@ -80,6 +80,7 @@ class LLMEngine:
                 token in (config.image_token_id, config.video_token_id) for token in prompt):
             raise ValueError("Visual placeholders require matching image/video data")
         seq = Sequence(prompt, sampling_params)
+        seq.prefix_cacheable = not bool(items)
         if items:
             from nanovllm.models.qwen3_5 import build_position_ids
             seq.position_ids, seq.rope_delta = build_position_ids(
@@ -118,7 +119,9 @@ class LLMEngine:
                      waiting=len(self.scheduler.waiting), running=len(self.scheduler.running),
                      sequences=[dict(seq_id=s.seq_id, cached_tokens=s.num_cached_tokens,
                                      scheduled_tokens=s.num_scheduled_tokens) for s in seqs])
-            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            plan = getattr(self.scheduler, "gdn_plan", None)
+            token_ids = (self.model_runner.call("run", seqs, is_prefill, plan) if plan is not None
+                         else self.model_runner.call("run", seqs, is_prefill))
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
             if getattr(self.model_runner, "visual_requests", None):
                 self.model_runner.release_visual([seq.seq_id for seq in seqs if seq.is_finished])
@@ -128,8 +131,10 @@ class LLMEngine:
                      running=len(self.scheduler.running))
             return outputs, num_tokens
         except BaseException as error:
-            if "seqs" in locals() and getattr(self.model_runner, "visual_requests", None):
-                self.abort_requests(seqs)
+            affected = getattr(self.scheduler, "_step_seqs", [])
+            self.scheduler.rollback_step()
+            if getattr(self.model_runner, "visual_requests", None):
+                self.model_runner.release_visual([seq.seq_id for seq in affected])
             if observer is not None:
                 emit(observer, "step_error", error=type(error).__name__ + ": " + str(error))
             raise

@@ -25,6 +25,9 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     num_gdn_slots: int = 64
+    enable_gdn_prefix_cache: bool = True
+    gdn_prefix_cache_retention_interval: int | None = 0
+    num_gdn_prefix_slots: int = 4
     max_images_per_prompt: int = 4
     max_videos_per_prompt: int = 1
     max_image_pixels: int = 262144
@@ -39,7 +42,7 @@ class Config:
         for name in ("max_num_batched_tokens", "max_num_seqs", "max_model_len",
                      "tensor_parallel_size", "kvcache_block_size", "num_gdn_slots",
                      "max_images_per_prompt", "max_videos_per_prompt", "max_image_pixels",
-                     "max_video_frames", "vision_cpu_cache_mb"):
+                     "max_video_frames", "vision_cpu_cache_mb", "num_gdn_prefix_slots"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -47,6 +50,13 @@ class Config:
             raise ValueError("tensor_parallel_size must be between 1 and 8")
         if self.kvcache_block_size % 256:
             raise ValueError("kvcache_block_size must be a positive multiple of 256")
+        if type(self.enable_gdn_prefix_cache) is not bool:
+            raise ValueError("enable_gdn_prefix_cache must be a boolean")
+        interval = self.gdn_prefix_cache_retention_interval
+        if interval is not None and (isinstance(interval, bool)
+                or not isinstance(interval, Integral) or interval < 0
+                or interval % self.kvcache_block_size):
+            raise ValueError("gdn_prefix_cache_retention_interval must be None or a nonnegative multiple of kvcache_block_size")
         if self.max_image_pixels < 1024:
             raise ValueError("max_image_pixels must be >=1024")
         if (isinstance(self.num_kvcache_blocks, bool)

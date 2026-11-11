@@ -88,7 +88,8 @@ class ModelRunner:
         dist.destroy_process_group()
         # Linear parameters carry bound loader methods, so model objects can form
         # cycles. Release pools and collect them before constructing another engine.
-        for name in ("model", "gdn_layers", "kv_cache", "conv_cache", "ssm_cache"):
+        for name in ("model", "gdn_layers", "kv_cache", "conv_cache", "ssm_cache",
+                     "prefix_conv_cache", "prefix_ssm_cache"):
             self.__dict__.pop(name, None)
         import gc
         gc.collect()
@@ -210,9 +211,12 @@ class ModelRunner:
     def allocate_gdn_cache(self):
         self.conv_cache = None
         self.ssm_cache = None
+        self.prefix_conv_cache = self.prefix_ssm_cache = None
         if not self.gdn_layers:
             return
         capacity = self.config.num_gdn_slots
+        prefix_capacity = (self.config.num_gdn_prefix_slots
+                           if getattr(self.config, "enable_gdn_prefix_cache", False) else 0)
         num_layers = len(self.gdn_layers)
         first_layer = self.gdn_layers[0]
         conv_shape = (capacity, first_layer.conv_dim, first_layer.conv_kernel_size - 1)
@@ -225,17 +229,22 @@ class ModelRunner:
             for layer in self.gdn_layers
         ):
             raise ValueError("GDN layers must have matching state shapes and convolution dtypes")
-        required_bytes = num_layers * capacity * (
+        required_bytes = num_layers * (capacity + prefix_capacity) * (
             first_layer.conv_dim * (first_layer.conv_kernel_size - 1) * first_layer.conv1d.weight.element_size()
             + first_layer.num_v_heads * first_layer.head_k_dim * first_layer.head_v_dim * 4
         )
         free, total = torch.cuda.mem_get_info()
         budget = int(total * self.config.gpu_memory_utilization) - (total - free) - self.workspace_bytes
         if required_bytes > budget:
-            raise RuntimeError("GDN state pool exceeds the memory budget; reduce num_gdn_slots")
+            raise RuntimeError("GDN state pools exceed the memory budget; reduce num_gdn_slots or num_gdn_prefix_slots")
         # 与 KV cache 一样，统一按 [层, ...] 开辟；各层持有对应切片的视图。
         self.conv_cache = torch.zeros(num_layers, *conv_shape, dtype=conv_dtype, device="cuda")
         self.ssm_cache = torch.zeros(num_layers, *ssm_shape, dtype=torch.float32, device="cuda")
+        if prefix_capacity:
+            self.prefix_conv_cache = torch.empty(
+                num_layers, prefix_capacity, *conv_shape[1:], dtype=conv_dtype, device="cuda")
+            self.prefix_ssm_cache = torch.empty(
+                num_layers, prefix_capacity, *ssm_shape[1:], dtype=torch.float32, device="cuda")
         for layer_id, layer in enumerate(self.gdn_layers):
             layer.conv_pool = self.conv_cache[layer_id]
             layer.ssm_pool = self.ssm_cache[layer_id]
@@ -375,16 +384,36 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, gdn_plan=None) -> list[int]:
         try:
+            if gdn_plan is not None:
+                self.copy_gdn_states(gdn_plan, restore=True)
             visual = self.prepare_visual_inputs(seqs, is_prefill) if getattr(self, "visual_requests", None) else None
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
             logits = (self.run_model(input_ids, positions, is_prefill, visual)
                       if visual is not None else self.run_model(input_ids, positions, is_prefill))
-            return self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            if gdn_plan is not None:
+                self.copy_gdn_states(gdn_plan, restore=False)
+            tokens = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            if gdn_plan is not None:
+                gdn_plan.completed = True
+            return tokens
         finally:
             reset_context()
+
+    def copy_gdn_states(self, plan, restore: bool):
+        if restore:
+            source = self.prefix_conv_cache, self.prefix_ssm_cache
+            target = self.conv_cache, self.ssm_cache
+            operations = ((op.checkpoint_slot, op.working_slot) for op in plan.restores)
+        else:
+            source = self.conv_cache, self.ssm_cache
+            target = self.prefix_conv_cache, self.prefix_ssm_cache
+            operations = ((op.working_slot, op.checkpoint_slot) for op in plan.saves)
+        for src, dst in operations:
+            for source_pool, target_pool in zip(source, target):
+                target_pool[:, dst].copy_(source_pool[:, src])
 
     @torch.inference_mode()
     def capture_cudagraph(self):
