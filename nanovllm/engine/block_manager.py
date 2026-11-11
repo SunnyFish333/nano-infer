@@ -1,4 +1,5 @@
 from collections import deque
+
 import xxhash
 import numpy as np
 
@@ -45,8 +46,7 @@ class BlockManager:
         return h.intdigest()
 
     def get_prefix_key(self, seq: Sequence, num_tokens: int) -> tuple[int, int]:
-        if num_tokens <= 0 or num_tokens % self.block_size or num_tokens > len(seq):
-            raise ValueError("Prefix key requires a positive, complete token boundary")
+        assert num_tokens > 0 and (not num_tokens % self.block_size) and (num_tokens <= len(seq)), 'Prefix key requires a positive, complete token boundary'
         count = num_tokens // self.block_size
         while len(seq.prefix_hashes) < count:
             i = len(seq.prefix_hashes)
@@ -72,8 +72,7 @@ class BlockManager:
 
     def allocate_with_prefix(self, seq: Sequence, block_ids: tuple[int, ...]):
         assert not seq.block_table
-        if not self.can_allocate_with_prefix(seq, block_ids):
-            raise RuntimeError("Insufficient KV blocks for selected prefix")
+        assert self.can_allocate_with_prefix(seq, block_ids), 'Insufficient KV blocks for selected prefix'
         # Protect all hits before allocating blocks that may evict idle cache entries.
         for block_id in block_ids:
             block = self.blocks[block_id]
@@ -109,8 +108,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         blocks = self.find_prefix_blocks(seq)[:num_cached_blocks] if num_cached_blocks else ()
-        if len(blocks) != num_cached_blocks:
-            raise RuntimeError("Selected KV prefix is no longer available")
+        assert len(blocks) == num_cached_blocks, 'Selected KV prefix is no longer available'
         self.allocate_with_prefix(seq, blocks)
 
     def deallocate(self, seq: Sequence):

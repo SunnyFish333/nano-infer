@@ -2,6 +2,8 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 
+import torch
+
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -38,7 +40,6 @@ class Sequence:
 
     def positions(self, start, end):
         """Slice original prompt positions and reconstruct generated text after preemption."""
-        import torch
         if getattr(self, "position_ids", None) is None:
             return torch.arange(start, end, dtype=torch.long, device="cpu")
         prompt_end = min(end, self.num_prompt_tokens)

@@ -178,10 +178,8 @@ class GDNAttention(nn.Module):
     ) -> None:
         super().__init__()
         assert dist.get_world_size() == 1, "GDN v1 requires tensor_parallel_size=1"
-        if num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
-            raise ValueError("num_v_heads must be a positive multiple of num_k_heads")
-        if conv_kernel_size < 1:
-            raise ValueError("conv_kernel_size must be positive")
+        assert num_k_heads > 0 and num_v_heads > 0 and (num_v_heads % num_k_heads == 0), 'num_v_heads must be a positive multiple of num_k_heads'
+        assert conv_kernel_size >= 1, 'conv_kernel_size must be positive'
         self.hidden_size = hidden_size
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
@@ -225,25 +223,19 @@ class GDNAttention(nn.Module):
 
         # kernel_size=1 时卷积历史长度为 0，不能用 conv_pool.numel() 判断初始化。
         warmup = self.ssm_pool.numel() == 0
-        if warmup and self.conv_pool.numel() != 0:
-            raise RuntimeError("GDN convolution and recurrent caches must be initialized together")
-        if warmup and not context.is_prefill:
-            raise RuntimeError("GDN decode requires initialized state caches; warmup supports prefill only")
-        if not warmup and context.gdn_slots is None:
-            raise RuntimeError("GDN execution requires context.gdn_slots")
+        assert not warmup or self.conv_pool.numel() == 0, 'GDN convolution and recurrent caches must be initialized together'
+        assert not warmup or context.is_prefill, 'GDN decode requires initialized state caches; warmup supports prefill only'
+        assert warmup or context.gdn_slots is not None, 'GDN execution requires context.gdn_slots'
         if context.is_prefill:
-            if context.cu_seqlens_q is None:
-                raise RuntimeError("GDN prefill requires context.cu_seqlens_q")
+            assert context.cu_seqlens_q is not None, 'GDN prefill requires context.cu_seqlens_q'
             cu = context.cu_seqlens_q.tolist()
             if warmup:
                 slots, has_initial = [None] * (len(cu) - 1), [False] * (len(cu) - 1)
             else:
                 slots = context.gdn_slots.tolist()
                 has_initial = context.gdn_has_initial
-                if has_initial is None:
-                    raise RuntimeError("GDN prefill requires context.gdn_has_initial")
-                if len(slots) != len(cu) - 1 or len(has_initial) != len(slots):
-                    raise ValueError("GDN prefill metadata must contain one entry per sequence")
+                assert has_initial is not None, 'GDN prefill requires context.gdn_has_initial'
+                assert len(slots) == len(cu) - 1 and len(has_initial) == len(slots), 'GDN prefill metadata must contain one entry per sequence'
             core = torch.empty_like(z)
             for i, slot in enumerate(slots):
                 t0, t1 = cu[i], cu[i + 1]

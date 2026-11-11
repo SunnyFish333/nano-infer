@@ -196,7 +196,7 @@ python example_qwen3_5.py
 通过 `LLM(model_path, **kwargs)` 选择检查点保留方式：
 
 ```python
-llm = LLM(model_path, num_gdn_slots=2, num_gdn_prefix_slots=4,
+llm = LLM(model_path, num_gdn_slots=6,
           gdn_prefix_cache_retention_interval=0)
 ```
 
@@ -206,7 +206,7 @@ llm = LLM(model_path, num_gdn_slots=2, num_gdn_prefix_slots=4,
 | `None` | 保留实际计算产生的全部对齐段末检查点 |
 | 正整数，如 `512` | 在默认检查点之外，保留落在指定 token 周期的检查点；周期必须是 `kvcache_block_size` 的整数倍 |
 
-密集保留不会自动生成一次预填充内部所有块边界的状态。检查点最多保留 `num_gdn_prefix_slots` 份，可随容量压力淘汰；更多槽位会占用额外显存。设置 `enable_gdn_prefix_cache=False` 可关闭 Qwen3.5 的跨请求前缀缓存并释放对应检查点预算。
+密集保留不会自动生成一次预填充内部所有块边界的状态。工作状态与检查点共用 `num_gdn_slots` 个槽位；活动请求优先使用容量，空闲槽可保存检查点，容量紧张时淘汰无引用检查点。没有可用槽时跳过保存。设置 `enable_gdn_prefix_cache=False` 可关闭跨请求前缀缓存，但不改变状态池总容量。
 
 ### Qwen3.5 图片与视频输入
 
@@ -230,7 +230,6 @@ outputs = llm.generate([request], SamplingParams(temperature=0.6, max_tokens=64)
 
 图片和视频会先进行预处理，再与文本一起计入上下文长度。较大的图片或更多视频帧会占用更多输入 token；超出上下文预算时，可降低图片像素上限、减少视频帧数或缩短生成长度。
 
-默认限制：每请求4张图片、1段视频、最多8个视频采样帧、采样2 FPS，单图/帧预处理面积上限262144像素，CPU视觉数据预算256 MiB。对应参数为 `max_images_per_prompt`、`max_videos_per_prompt`、`max_video_frames`、`video_fps`、`max_image_pixels` 和 `vision_cpu_cache_mb`。小显存示例使用65536像素上限。超出预算的请求会拒绝；视觉工作区在分配 KV cache 前预留。
 
 ### 常用运行参数
 
@@ -242,10 +241,9 @@ outputs = llm.generate([request], SamplingParams(temperature=0.6, max_tokens=64)
 | `max_num_batched_tokens` | `16384` | 单轮 Prefill 的 token 预算；较长输入会分块处理，需为正整数 |
 | `max_num_seqs` | `512` | 单轮调度的序列数上限；小显存建议从1或2开始 |
 | `gpu_memory_utilization` | `0.9` | 总显存预算比例；必须留出权重、工作区和缓存空间 |
-| `num_gdn_slots` | `64` | GDN 请求状态容量；Qwen3.5 小显存可从2开始 |
+| `num_gdn_slots` | `64` | GDN 工作状态与检查点共享的总槽数；小显存可从2开始 |
 | `enable_gdn_prefix_cache` | `True` | 开启 Qwen3.5 纯文本 KV/GDN 联合前缀复用 |
 | `gdn_prefix_cache_retention_interval` | `0` | 检查点保留方式：`0`、`None` 或块大小的正整数倍 |
-| `num_gdn_prefix_slots` | `4` | GDN 前缀检查点容量，独立于活动请求槽位；关闭前缀缓存时不分配 |
 | `enforce_eager` | `False` | `True` 关闭执行器 CUDA Graph，局部 `torch.compile` 仍会运行；Qwen3 MoE需显式为True，GDN模型自动为True |
 | `tensor_parallel_size` | `1` | 单机GPU数，配置范围1–8，还需设备数及分片维度合法；Qwen3.5仅支持1 |
 

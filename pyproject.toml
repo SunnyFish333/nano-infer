@@ -30,7 +30,6 @@ Homepage="https://github.com/SunnyFish333/nano-infer"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
 
 [project.optional-dependencies]
-benchmark = ["matplotlib"]
 test = ["pytest>=9,<10", "pytest-cov>=6,<8"]
 
 [tool.pytest.ini_options]

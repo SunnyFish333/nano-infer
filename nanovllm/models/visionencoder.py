@@ -3,7 +3,6 @@
 Uses PyTorch SDPA with independent, bidirectional attention per temporal patch.
 No decoder Context or persistent KV cache is used here.
 """
-
 import math
 
 import torch
@@ -55,8 +54,7 @@ class VisionAttention(nn.Module):
 class VisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        if config.hidden_act not in ("gelu_pytorch_tanh", "gelu"):
-            raise ValueError("Unsupported vision activation: " + config.hidden_act)
+        assert config.hidden_act in ('gelu_pytorch_tanh', 'gelu'), 'Unsupported vision activation: ' + config.hidden_act
         self.approximate = "tanh" if config.hidden_act == "gelu_pytorch_tanh" else "none"
         self.linear_fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.linear_fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
@@ -97,13 +95,10 @@ class Qwen3_5VisionEncoder(nn.Module):
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         heads = config.num_heads
-        if config.hidden_size % heads or (config.hidden_size // heads) % 4:
-            raise ValueError("Vision head dimension must be divisible by four")
-        if getattr(config, "deepstack_visual_indexes", []):
-            raise ValueError("Qwen3.5 does not use DeepStack")
+        assert not config.hidden_size % heads and (not config.hidden_size // heads % 4), 'Vision head dimension must be divisible by four'
+        assert not getattr(config, 'deepstack_visual_indexes', []), 'Qwen3.5 does not use DeepStack'
         self.side = math.isqrt(config.num_position_embeddings)
-        if self.side ** 2 != config.num_position_embeddings:
-            raise ValueError("Vision position embedding grid must be square")
+        assert self.side ** 2 == config.num_position_embeddings, 'Vision position embedding grid must be square'
         self.patch_embed = VisionPatchEmbed(config)
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
         self.blocks = nn.ModuleList([VisionBlock(config) for _ in range(config.depth)])
@@ -118,8 +113,7 @@ class Qwen3_5VisionEncoder(nn.Module):
         coords, positions, lengths = [], [], []
         merge = self.spatial_merge_size
         for t, h, w in grid_thw.tolist():
-            if min(t, h, w) <= 0 or h % merge or w % merge:
-                raise ValueError("Vision grid must be positive and divisible by spatial merge size")
+            assert min(t, h, w) > 0 and (not h % merge) and (not w % merge), 'Vision grid must be positive and divisible by spatial merge size'
             row, col = torch.meshgrid(torch.arange(h, device=device),
                                       torch.arange(w, device=device), indexing="ij")
             def order(x):
@@ -146,10 +140,8 @@ class Qwen3_5VisionEncoder(nn.Module):
         return torch.cat(positions), lengths, freqs.cos(), freqs.sin()
 
     def forward(self, pixel_values, grid_thw):
-        if grid_thw.ndim != 2 or grid_thw.shape[1] != 3 or not len(grid_thw):
-            raise ValueError("grid_thw must have shape [num_items, 3]")
-        if len(pixel_values) != int(grid_thw.prod(-1).sum()):
-            raise ValueError("Patch count does not match vision grid")
+        assert grid_thw.ndim == 2 and grid_thw.shape[1] == 3 and len(grid_thw), 'grid_thw must have shape [num_items, 3]'
+        assert len(pixel_values) == int(grid_thw.prod(-1).sum()), 'Patch count does not match vision grid'
         x = self.patch_embed(pixel_values)
         pos, lengths, cos, sin = self.grid_metadata(grid_thw, x.device)
         x = x + pos.to(x.dtype)

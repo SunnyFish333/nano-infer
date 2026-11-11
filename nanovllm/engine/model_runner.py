@@ -1,14 +1,14 @@
+import gc
 import pickle
-import torch
-import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
+import torch
+import torch.distributed as dist
+
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-
 from nanovllm.models.registry import build_model
-
 from nanovllm.layers.sampler import Sampler
 from nanovllm.layers.gdn_attention import GDNAttention
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -26,7 +26,6 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.visual_requests = {}
-        self.visual_cpu_bytes = 0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -44,8 +43,7 @@ class ModelRunner:
             self.gdn_layers = [module for module in self.model.modules() if isinstance(module, GDNAttention)]
             config.has_gdn = bool(self.gdn_layers)
             if config.has_gdn:
-                if self.world_size != 1:
-                    raise ValueError("GDN state scheduling v1 requires tensor_parallel_size=1")
+                assert self.world_size == 1, 'GDN state scheduling v1 requires tensor_parallel_size=1'
                 self.enforce_eager = config.enforce_eager = True
             load_model(self.model, config.model)
             self.sampler = Sampler()
@@ -57,10 +55,6 @@ class ModelRunner:
             self.allocate_kv_cache()
             if not self.enforce_eager:
                 self.capture_cudagraph()
-        except BaseException:
-            reset_context()
-            dist.destroy_process_group()
-            raise
         finally:
             torch.set_default_device(str(default_device))
             torch.set_default_dtype(default_dtype)
@@ -76,7 +70,6 @@ class ModelRunner:
 
     def exit(self):
         self.visual_requests.clear()
-        self.visual_cpu_bytes = 0
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -88,10 +81,8 @@ class ModelRunner:
         dist.destroy_process_group()
         # Linear parameters carry bound loader methods, so model objects can form
         # cycles. Release pools and collect them before constructing another engine.
-        for name in ("model", "gdn_layers", "kv_cache", "conv_cache", "ssm_cache",
-                     "prefix_conv_cache", "prefix_ssm_cache"):
+        for name in ("model", "gdn_layers", "kv_cache", "conv_cache", "ssm_cache"):
             self.__dict__.pop(name, None)
-        import gc
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -161,22 +152,11 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def register_visual(self, seq_id, items):
-        size = sum(item.pixel_values.numel()*item.pixel_values.element_size() for item in items)
-        # Account for feature storage before encoding so requests cannot overcommit CPU memory.
-        hidden = self.config.text_config.hidden_size
-        dtype_bytes = (self.model.lm_head.weight.element_size()
-                       if hasattr(self.model, "lm_head") else 2)
-        size += sum((item.end-item.start)*hidden*dtype_bytes for item in items)
-        if self.visual_cpu_bytes + size > self.config.vision_cpu_cache_mb * 1024**2:
-            raise ValueError("Visual request data exceeds vision_cpu_cache_mb")
-        self.visual_requests[seq_id] = (items, {}, size)
-        self.visual_cpu_bytes += size
+        self.visual_requests[seq_id] = (items, {})
 
     def release_visual(self, seq_ids):
         for seq_id in seq_ids:
-            value = self.visual_requests.pop(seq_id, None)
-            if value is not None:
-                self.visual_cpu_bytes -= value[2]
+            self.visual_requests.pop(seq_id, None)
 
     @torch.inference_mode()
     def prepare_visual_inputs(self, seqs, is_prefill):
@@ -187,7 +167,7 @@ class ModelRunner:
             start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
             entry = self.visual_requests.get(seq.seq_id)
             if entry is not None:
-                items, cache, _ = entry
+                items, cache = entry
                 for index, item in enumerate(items):
                     left, right = max(start, item.start), min(end, item.end)
                     if left >= right:
@@ -196,8 +176,7 @@ class ModelRunner:
                         device = self.model.model.visual.patch_embed.proj.weight.device
                         output = self.model.encode_vision(item.pixel_values.to(device),
                                     torch.tensor([item.grid_thw], device="cpu"))
-                        if output.shape != (item.end-item.start, self.config.text_config.hidden_size):
-                            raise ValueError("Vision features do not match placeholder interval")
+                        assert output.shape == (item.end - item.start, self.config.text_config.hidden_size), 'Vision features do not match placeholder interval'
                         cache[index] = output.cpu()
                     features.append(cache[index][left-item.start:right-item.start])
                     indices.extend(range(base+left-start, base+right-start))
@@ -211,40 +190,26 @@ class ModelRunner:
     def allocate_gdn_cache(self):
         self.conv_cache = None
         self.ssm_cache = None
-        self.prefix_conv_cache = self.prefix_ssm_cache = None
         if not self.gdn_layers:
             return
         capacity = self.config.num_gdn_slots
-        prefix_capacity = (self.config.num_gdn_prefix_slots
-                           if getattr(self.config, "enable_gdn_prefix_cache", False) else 0)
         num_layers = len(self.gdn_layers)
         first_layer = self.gdn_layers[0]
         conv_shape = (capacity, first_layer.conv_dim, first_layer.conv_kernel_size - 1)
         ssm_shape = (capacity, first_layer.num_v_heads, first_layer.head_k_dim, first_layer.head_v_dim)
         conv_dtype = first_layer.conv1d.weight.dtype
-        if any(
-            (capacity, layer.conv_dim, layer.conv_kernel_size - 1) != conv_shape
-            or (capacity, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim) != ssm_shape
-            or layer.conv1d.weight.dtype != conv_dtype
-            for layer in self.gdn_layers
-        ):
-            raise ValueError("GDN layers must have matching state shapes and convolution dtypes")
-        required_bytes = num_layers * (capacity + prefix_capacity) * (
+        assert not any(((capacity, layer.conv_dim, layer.conv_kernel_size - 1) != conv_shape or (capacity, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim) != ssm_shape or layer.conv1d.weight.dtype != conv_dtype for layer in self.gdn_layers)), 'GDN layers must have matching state shapes and convolution dtypes'
+        required_bytes = num_layers * capacity * (
             first_layer.conv_dim * (first_layer.conv_kernel_size - 1) * first_layer.conv1d.weight.element_size()
             + first_layer.num_v_heads * first_layer.head_k_dim * first_layer.head_v_dim * 4
         )
         free, total = torch.cuda.mem_get_info()
         budget = int(total * self.config.gpu_memory_utilization) - (total - free) - self.workspace_bytes
-        if required_bytes > budget:
-            raise RuntimeError("GDN state pools exceed the memory budget; reduce num_gdn_slots or num_gdn_prefix_slots")
+        assert required_bytes <= budget, 'GDN state pools exceed the memory budget; reduce num_gdn_slots'
         # 与 KV cache 一样，统一按 [层, ...] 开辟；各层持有对应切片的视图。
-        self.conv_cache = torch.zeros(num_layers, *conv_shape, dtype=conv_dtype, device="cuda")
-        self.ssm_cache = torch.zeros(num_layers, *ssm_shape, dtype=torch.float32, device="cuda")
-        if prefix_capacity:
-            self.prefix_conv_cache = torch.empty(
-                num_layers, prefix_capacity, *conv_shape[1:], dtype=conv_dtype, device="cuda")
-            self.prefix_ssm_cache = torch.empty(
-                num_layers, prefix_capacity, *ssm_shape[1:], dtype=torch.float32, device="cuda")
+        conv_cache = torch.zeros(num_layers, *conv_shape, dtype=conv_dtype, device="cuda")
+        ssm_cache = torch.zeros(num_layers, *ssm_shape, dtype=torch.float32, device="cuda")
+        self.conv_cache, self.ssm_cache = conv_cache, ssm_cache
         for layer_id, layer in enumerate(self.gdn_layers):
             layer.conv_pool = self.conv_cache[layer_id]
             layer.ssm_pool = self.ssm_cache[layer_id]
@@ -253,15 +218,13 @@ class ModelRunner:
         config = self.config
         attention_layers = [module for module in self.model.modules()
                             if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
-        if not attention_layers:
-            raise ValueError("This scheduler requires at least one full-attention layer")
+        assert attention_layers, 'This scheduler requires at least one full-attention layer'
         free, total = torch.cuda.mem_get_info()
         used = total - free
         num_layers = len(attention_layers)
         num_kv_heads = attention_layers[0].num_kv_heads
         head_dim = attention_layers[0].head_dim
-        if any(layer.num_kv_heads != num_kv_heads or layer.head_dim != head_dim for layer in attention_layers):
-            raise ValueError("Full-attention layers must have matching KV head layouts")
+        assert not any((layer.num_kv_heads != num_kv_heads or layer.head_dim != head_dim for layer in attention_layers)), 'Full-attention layers must have matching KV head layouts'
         dtype = torch.get_default_dtype()
         block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - self.workspace_bytes) // block_bytes
@@ -403,17 +366,13 @@ class ModelRunner:
             reset_context()
 
     def copy_gdn_states(self, plan, restore: bool):
-        if restore:
-            source = self.prefix_conv_cache, self.prefix_ssm_cache
-            target = self.conv_cache, self.ssm_cache
-            operations = ((op.checkpoint_slot, op.working_slot) for op in plan.restores)
-        else:
-            source = self.conv_cache, self.ssm_cache
-            target = self.prefix_conv_cache, self.prefix_ssm_cache
-            operations = ((op.working_slot, op.checkpoint_slot) for op in plan.saves)
+        operations = ([(op.checkpoint_slot, op.working_slot) for op in plan.restores]
+                      if restore else [(op.working_slot, op.checkpoint_slot) for op in plan.saves])
+        capacity = self.conv_cache.shape[1]
         for src, dst in operations:
-            for source_pool, target_pool in zip(source, target):
-                target_pool[:, dst].copy_(source_pool[:, src])
+            assert src != dst and (0 <= src < capacity and 0 <= dst < capacity), 'Invalid GDN state copy slots'
+            self.conv_cache[:, dst].copy_(self.conv_cache[:, src])
+            self.ssm_cache[:, dst].copy_(self.ssm_cache[:, src])
 
     @torch.inference_mode()
     def capture_cudagraph(self):

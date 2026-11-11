@@ -1,5 +1,4 @@
 """Qwen3.5 Dense text/image/video model (single GPU, eager execution)."""
-
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -32,15 +31,13 @@ def build_position_ids(token_ids, visual_items, spatial_merge_size=2):
     positions = torch.empty(3, len(token_ids), dtype=torch.long, device="cpu")
     cursor = current = 0
     for item in visual_items:
-        if item.start < cursor or item.end > len(token_ids):
-            raise ValueError("Overlapping or out-of-range visual intervals")
+        assert item.start >= cursor and item.end <= len(token_ids), 'Overlapping or out-of-range visual intervals'
         n = item.start - cursor
         positions[:, cursor:item.start] = torch.arange(n)[None] + current
         current += n
         t, h, w = item.grid_thw
         h, w = h // spatial_merge_size, w // spatial_merge_size
-        if t != 1 or h * w != item.end - item.start:
-            raise ValueError("Visual interval must match one temporal grid")
+        assert t == 1 and h * w == item.end - item.start, 'Visual interval must match one temporal grid'
         positions[0, item.start:item.end] = current
         positions[1, item.start:item.end] = torch.arange(h).repeat_interleave(w) + current
         positions[2, item.start:item.end] = torch.arange(w).repeat(h) + current
@@ -55,14 +52,10 @@ class Qwen3_5Attention(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         tp_size = dist.get_world_size()
-        if config.num_attention_heads % tp_size or config.num_key_value_heads % tp_size:
-            raise ValueError("Attention head counts must be divisible by tensor parallel size")
-        if config.num_attention_heads % config.num_key_value_heads:
-            raise ValueError("Query head count must be a multiple of KV head count")
-        if not getattr(config, "attn_output_gate", True):
-            raise ValueError("Qwen3.5 backbone currently requires gated full attention")
-        if getattr(config, "attention_bias", False):
-            raise ValueError("Qwen3.5 backbone currently requires attention_bias=False")
+        assert not config.num_attention_heads % tp_size and (not config.num_key_value_heads % tp_size), 'Attention head counts must be divisible by tensor parallel size'
+        assert not config.num_attention_heads % config.num_key_value_heads, 'Query head count must be a multiple of KV head count'
+        assert getattr(config, 'attn_output_gate', True), 'Qwen3.5 backbone currently requires gated full attention'
+        assert not getattr(config, 'attention_bias', False), 'Qwen3.5 backbone currently requires attention_bias=False'
         self.layer_idx = layer_idx
         self.reference_numerics = getattr(config, "reference_numerics", False)
         self.num_heads = config.num_attention_heads // tp_size
@@ -83,17 +76,12 @@ class Qwen3_5Attention(nn.Module):
         self.k_norm = norm_class(config)(self.head_dim, eps=config.rms_norm_eps)
 
         rope = getattr(config, "rope_parameters", None) or {}
-        if rope.get("rope_type", "default") != "default":
-            raise ValueError("Only default Qwen3.5 rotary frequencies are supported")
+        assert rope.get('rope_type', 'default') == 'default', 'Only default Qwen3.5 rotary frequencies are supported'
         rotary_dim = int(self.head_dim * rope.get(
             "partial_rotary_factor", getattr(config, "partial_rotary_factor", 0.25)))
         sections = rope.get("mrope_section", [11, 11, 10])
-        if (not 0 < rotary_dim <= self.head_dim or rotary_dim % 2
-                or len(sections) != 3 or any(s < 0 for s in sections)
-                or sum(sections) != rotary_dim // 2):
-            raise ValueError("Invalid rotary dimension or MRoPE sections")
-        if not rope.get("mrope_interleaved", True):
-            raise ValueError("This backbone implements interleaved MRoPE only")
+        assert 0 < rotary_dim <= self.head_dim and (not rotary_dim % 2) and (len(sections) == 3) and (not any((s < 0 for s in sections))) and (sum(sections) == rotary_dim // 2), 'Invalid rotary dimension or MRoPE sections'
+        assert rope.get('mrope_interleaved', True), 'This backbone implements interleaved MRoPE only'
         self.rotary_emb = MRotaryEmbedding(
             head_size=self.head_dim, rotary_dim=rotary_dim,
             base=rope.get("rope_theta", getattr(config, "rope_theta", 10000000)),
@@ -160,8 +148,7 @@ class Qwen3_5Attention(nn.Module):
 class Qwen3_5MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        if config.hidden_act != "silu":
-            raise ValueError("Qwen3.5 MLP currently supports hidden_act='silu' only")
+        assert config.hidden_act == 'silu', "Qwen3.5 MLP currently supports hidden_act='silu' only"
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size, [config.intermediate_size] * 2, bias=False)
         self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
@@ -192,7 +179,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 conv_kernel_size=config.linear_conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps)
         else:
-            raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type!r}")
+            assert False, f"Unsupported Qwen3.5 layer type: {self.layer_type!r}"
         self.mlp = Qwen3_5MLP(config)
         self.input_layernorm = norm_class(config)(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = norm_class(config)(config.hidden_size, eps=config.rms_norm_eps)
@@ -218,8 +205,7 @@ class Qwen3_5DecoderLayer(nn.Module):
 class Qwen3_5TextModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        if len(config.layer_types) != config.num_hidden_layers:
-            raise ValueError("layer_types must contain one entry per decoder layer")
+        assert len(config.layer_types) == config.num_hidden_layers, 'layer_types must contain one entry per decoder layer'
         self.hidden_size = config.hidden_size
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
@@ -229,21 +215,10 @@ class Qwen3_5TextModel(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
                 image_embeds: torch.Tensor | None = None,
                 image_token_mask: torch.Tensor | None = None) -> torch.Tensor:
-        if input_ids.ndim != 1:
-            raise ValueError("Expected flattened input_ids with shape [N]")
         if positions.ndim == 1:
             positions = positions.unsqueeze(0).expand(3, -1)
-        if positions.shape != (3, input_ids.numel()):
-            raise ValueError("positions must have shape [N] or [3,N]")
         hidden_states = self.embed_tokens(input_ids)
-        if (image_embeds is None) != (image_token_mask is None):
-            raise ValueError("image_embeds and image_token_mask must be provided together")
         if image_embeds is not None:
-            if image_token_mask.dtype != torch.bool or image_token_mask.shape != input_ids.shape:
-                raise ValueError("image_token_mask must be a boolean tensor with shape [N]")
-            expected_shape = (int(image_token_mask.sum().item()), self.hidden_size)
-            if image_embeds.shape != expected_shape:
-                raise ValueError(f"Expected image_embeds shape {expected_shape}, got {tuple(image_embeds.shape)}")
             hidden_states = hidden_states.masked_scatter(
                 image_token_mask.unsqueeze(-1).expand_as(hidden_states),
                 image_embeds.to(device=hidden_states.device, dtype=hidden_states.dtype))
@@ -259,8 +234,7 @@ class Qwen3_5Model(nn.Module):
         self.language_model = Qwen3_5TextModel(text_config)
         vision_config = getattr(config, "vision_config", None)
         self.visual = Qwen3_5VisionEncoder(vision_config) if vision_config is not None else None
-        if vision_config is not None and vision_config.out_hidden_size != text_config.hidden_size:
-            raise ValueError("Vision output dimension must match text hidden size")
+        assert vision_config is None or vision_config.out_hidden_size == text_config.hidden_size, 'Vision output dimension must match text hidden size'
 
     def forward(self, input_ids, positions, image_embeds=None, image_token_mask=None):
         return self.language_model(input_ids, positions, image_embeds, image_token_mask)
@@ -277,11 +251,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        if dist.get_world_size() != 1:
-            raise ValueError("Qwen3.5 language backbone v1 requires tensor_parallel_size=1")
+        assert dist.get_world_size() == 1, 'Qwen3.5 language backbone v1 requires tensor_parallel_size=1'
         text_config = getattr(config, "text_config", config)
-        if getattr(text_config, "num_experts", 0) > 0:
-            raise ValueError("Qwen3.5 MoE is not implemented by the Dense backbone")
+        assert getattr(text_config, 'num_experts', 0) <= 0, 'Qwen3.5 MoE is not implemented by the Dense backbone'
         self.model = Qwen3_5Model(config)
         self.lm_head = ParallelLMHead(text_config.vocab_size, text_config.hidden_size)
         if getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)):
@@ -299,18 +271,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         return name
 
     def encode_vision(self, pixel_values, grid_thw):
-        if self.model.visual is None:
-            raise ValueError("Checkpoint does not contain a vision encoder")
+        assert self.model.visual is not None, 'Checkpoint does not contain a vision encoder'
         return self.model.visual(pixel_values, grid_thw)
 
-    def validate_loaded_weights(self, loaded_shards: dict[int, set]):
-        missing = []
-        for name, param in self.named_parameters():
-            expected = {0, 1} if name.endswith(".gate_up_proj.weight") else {None}
-            if not expected.issubset(loaded_shards.get(id(param), set())):
-                missing.append(name)
-        if missing:
-            raise ValueError("Missing Qwen3.5 weights or shards: " + ", ".join(missing))
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
                 image_embeds: torch.Tensor | None = None,

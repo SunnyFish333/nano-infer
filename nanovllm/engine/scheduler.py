@@ -6,13 +6,11 @@ from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.gdn_state_manager import (
     GDNStateManager, GDNStepPlan, GDNRestoreOp, GDNSaveOp,
 )
-from nanovllm.engine.observer import emit
 
 
 class Scheduler:
 
-    def __init__(self, config: Config, observer=None):
-        self.observer = observer
+    def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
@@ -22,8 +20,8 @@ class Scheduler:
                                           enable_prefix_cache=not config.has_gdn or self.gdn_prefix_enabled)
         self.gdn_state_manager = (GDNStateManager(
             config.num_gdn_slots,
-            getattr(config, "num_gdn_prefix_slots", 4) if self.gdn_prefix_enabled else 0,
-            self.block_size, getattr(config, "gdn_prefix_cache_retention_interval", 0),
+            self.block_size, self.gdn_prefix_enabled,
+            getattr(config, "gdn_prefix_cache_retention_interval", 0),
         ) if config.has_gdn else None)
         self.gdn_plan: GDNStepPlan | None = None
         self._step_seqs: list[Sequence] = []
@@ -38,6 +36,7 @@ class Scheduler:
 
     def abort(self, seq):
         """Discard a failed/cancelled request and all decoder state references."""
+        assert self.gdn_plan is None or self.gdn_plan.closed or seq not in self._step_seqs, 'Finalize the GDN step before cancelling a scheduled request'
         for queue in (self.waiting, self.running):
             if seq in queue:
                 queue.remove(seq)
@@ -47,27 +46,18 @@ class Scheduler:
         seq.num_scheduled_tokens = 0
         seq.status = SequenceStatus.FINISHED
 
-    def observe_resources(self, seq=None, reason="snapshot"):
-        if self.observer is None:
-            return
-        manager = self.block_manager
-        slots = self.gdn_state_manager
-        payload = dict(reason=reason, used_blocks=len(manager.used_block_ids),
-                       free_blocks=len(manager.free_block_ids),
-                       used_slots=len(slots.used_slots) if slots else 0,
-                       total_slots=len(slots.used_slots) + len(slots.free_slots) if slots else 0)
-        if seq is not None:
-            payload.update(seq_id=seq.seq_id, assigned_blocks=len(seq.block_table),
-                           cached_tokens=seq.num_cached_tokens, gdn_slot=seq.gdn_slot)
-        emit(self.observer, "resource", **payload)
 
     def _prefix_candidate(self, seq):
         blocks = self.block_manager.find_prefix_blocks(seq)
         checkpoint = None
         if self.gdn_state_manager:
-            checkpoint = self.gdn_state_manager.find_checkpoint(
-                seq, len(blocks) * self.block_size, self.block_manager.get_prefix_key)
-            blocks = blocks[:checkpoint.key[1] // self.block_size] if checkpoint else ()
+            for cp in self.gdn_state_manager.iter_checkpoints(
+                    seq, len(blocks) * self.block_size, self.block_manager.get_prefix_key):
+                selected = blocks[:cp.key[1] // self.block_size]
+                if (self.gdn_state_manager.can_allocate(seq, cp.slot_id)
+                        and self.block_manager.can_allocate_with_prefix(seq, selected)):
+                    return selected, cp
+            blocks = ()
         return blocks, checkpoint
 
     def rollback_step(self):
@@ -88,8 +78,7 @@ class Scheduler:
         return end
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        if self.gdn_plan is not None and not self.gdn_plan.closed:
-            raise RuntimeError("Previous GDN step has not been finalized")
+        assert self.gdn_plan is None or self.gdn_plan.closed, 'Previous GDN step has not been finalized'
         self.gdn_plan = GDNStepPlan() if self.gdn_prefix_enabled else None
         self._step_seqs = []
         try:
@@ -118,9 +107,10 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                if self.gdn_state_manager and not self.gdn_state_manager.can_allocate(seq):
-                    break
                 prefix_blocks, checkpoint = self._prefix_candidate(seq)
+                if self.gdn_state_manager and not self.gdn_state_manager.can_allocate(
+                        seq, checkpoint.slot_id if checkpoint else None):
+                    break
                 if not self.block_manager.can_allocate_with_prefix(seq, prefix_blocks):
                     break
                 num_cached_blocks = len(prefix_blocks)
@@ -147,7 +137,6 @@ class Scheduler:
                     if checkpoint is not None:
                         self.gdn_plan.restores[-1] = GDNRestoreOp(
                             seq.seq_id, checkpoint.slot_id, seq.gdn_slot, checkpoint.key[1])
-                self.observe_resources(seq, "allocate")
             seq.num_scheduled_tokens = end - seq.num_cached_tokens
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -177,7 +166,6 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
-                self.observe_resources(seq, "append")
                 scheduled_seqs.append(seq)
         if not scheduled_seqs:
             if self.waiting and not self.running:
@@ -185,7 +173,8 @@ class Scheduler:
                 can_get_slot = not self.gdn_state_manager or self.gdn_state_manager.can_allocate(seq)
                 blocks, _ = self._prefix_candidate(seq)
                 if (not self.block_manager.can_allocate_with_prefix(seq, blocks) or not can_get_slot):
-                    raise RuntimeError("Request exceeds the KV cache capacity; increase cache memory or shorten input")
+                    resource = "GDN working slot" if not can_get_slot else "KV cache"
+                    raise RuntimeError(f"Request exceeds the {resource} capacity; increase cache memory or shorten input")
                 # 单个 decode 请求被抢占后，本轮改为重新 prefill。
                 return self._schedule()
             raise RuntimeError("No request can be scheduled")
@@ -193,15 +182,13 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        assert self.gdn_plan is None or self.gdn_plan.closed or seq not in self._step_seqs, 'Finalize the GDN step before preempting a scheduled request'
         # Internal decode scheduling has already popped seq; explicit preemption
         # must also detach it before re-enqueueing to avoid duplicate execution.
         if seq in self.running:
             self.running.remove(seq)
         if seq in self.waiting:
             self.waiting.remove(seq)
-        if self.observer is not None:
-            emit(self.observer, "preempt", seq_id=seq.seq_id,
-                 cached_tokens=seq.num_cached_tokens)
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
@@ -209,14 +196,10 @@ class Scheduler:
             self.gdn_state_manager.deallocate(seq)
         seq.num_scheduled_tokens = 0
         self.waiting.appendleft(seq)
-        self.observe_resources(seq, "preempt_release")
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        if len(seqs) != len(token_ids):
-            raise ValueError("Runner must return one token per scheduled sequence")
-        if (self.gdn_plan is not None and (self.gdn_plan.restores or self.gdn_plan.saves)
-                and not self.gdn_plan.completed):
-            raise RuntimeError("Runner has not completed this GDN step")
+        assert len(seqs) == len(token_ids), 'Runner must return one token per scheduled sequence'
+        assert self.gdn_plan is None or (not self.gdn_plan.restores and (not self.gdn_plan.saves)) or self.gdn_plan.completed, 'Runner has not completed this GDN step'
         for seq in seqs:
             self.block_manager.hash_blocks(seq)
         if self.gdn_plan is not None:
@@ -228,20 +211,12 @@ class Scheduler:
                 seq.num_gdn_cached_tokens += seq.num_scheduled_tokens
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            self.observe_resources(seq, "computed")
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if self.observer is not None:
-                emit(self.observer, "token_ready", seq_id=seq.seq_id, token_id=token_id,
-                     phase="prefill" if is_prefill else "decode")
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 if self.gdn_state_manager:
                     self.gdn_state_manager.deallocate(seq)
                 self.running.remove(seq)
-                self.observe_resources(seq, "finish_release")
-                if self.observer is not None:
-                    emit(self.observer, "request_finished", seq_id=seq.seq_id,
-                         reason="eos" if not seq.ignore_eos and token_id == self.eos else "length")
