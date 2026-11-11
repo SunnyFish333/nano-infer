@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from struct import pack
 
 import torch
 
@@ -32,6 +33,8 @@ class Sequence:
         self.num_gdn_cached_tokens = 0
         self.prefix_cacheable = True
         self.prefix_hashes: list[int] = []
+        self.prefix_digests: list[bytes] = []
+        self.visual_spans: tuple[tuple[int, int, str, bytes], ...] = ()
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -51,6 +54,35 @@ class Sequence:
             parts.append((torch.arange(generated_start, end, device="cpu")
                           + self.rope_delta)[None].expand(3, -1))
         return torch.cat(parts, dim=1)
+
+    def prefix_extra_keys(self, start, end):
+        """Describe this block's model inputs without retaining pixels."""
+        extras = []
+        # Binary search avoids rescanning all earlier media on each decode block.
+        lo, hi = 0, len(self.visual_spans)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.visual_spans[mid][1] <= start:
+                lo = mid + 1
+            else:
+                hi = mid
+        for index in range(lo, len(self.visual_spans)):
+            s, e, modality, digest = self.visual_spans[index]
+            if s >= end:
+                break
+            kind = modality.encode()
+            extras.append(b"nanovllm.span.v1" + digest + pack("<Q", len(kind)) + kind
+                          + pack("<4q", s, e, max(start, s) - s, min(end, e) - s))
+        if self.position_ids is None:
+            return tuple(extras)
+        positions = self.positions(start, end)
+        if positions.ndim == 1:
+            positions = positions[None].expand(3, -1)
+        ordinary = torch.arange(start, end, dtype=torch.long, device="cpu")[None].expand(3, -1)
+        if not torch.equal(positions, ordinary):
+            coords = positions.reshape(-1).tolist()
+            extras.append(b"nanovllm.positions.v1" + pack(f"<{len(coords)}q", *coords))
+        return tuple(extras)
 
     def __len__(self):
         return self.num_tokens

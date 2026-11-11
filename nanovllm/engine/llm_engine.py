@@ -65,7 +65,8 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         config = getattr(self, "config", None) or self.model_runner.config
         seq = Sequence(prompt, sampling_params)
-        seq.prefix_cacheable = not bool(items)
+        seq.visual_spans = tuple((item.start, item.end, item.modality, item.content_digest)
+                                 for item in items)
         if items:
             seq.position_ids, seq.rope_delta = build_position_ids(
                 prompt, items, config.vision_config.spatial_merge_size)

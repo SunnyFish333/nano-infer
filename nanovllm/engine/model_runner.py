@@ -55,6 +55,9 @@ class ModelRunner:
             self.allocate_kv_cache()
             if not self.enforce_eager:
                 self.capture_cudagraph()
+        except BaseException:
+            dist.destroy_process_group()
+            raise
         finally:
             torch.set_default_device(str(default_device))
             torch.set_default_dtype(default_dtype)

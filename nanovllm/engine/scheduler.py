@@ -52,7 +52,8 @@ class Scheduler:
         checkpoint = None
         if self.gdn_state_manager:
             for cp in self.gdn_state_manager.iter_checkpoints(
-                    seq, len(blocks) * self.block_size, self.block_manager.get_prefix_key):
+                    seq, len(blocks) * self.block_size, self.block_manager.get_prefix_key,
+                    self.block_manager.get_prefix_digest):
                 selected = blocks[:cp.key[1] // self.block_size]
                 if (self.gdn_state_manager.can_allocate(seq, cp.slot_id)
                         and self.block_manager.can_allocate_with_prefix(seq, selected)):
@@ -88,7 +89,8 @@ class Scheduler:
                     end = seq.num_cached_tokens + seq.num_scheduled_tokens
                     if self.gdn_state_manager.should_retain(seq, end):
                         key = self.block_manager.get_prefix_key(seq, end)
-                        slot = self.gdn_state_manager.reserve_checkpoint(key, tuple(seq[:end]))
+                        slot = self.gdn_state_manager.reserve_checkpoint(
+                            key, tuple(seq[:end]), self.block_manager.get_prefix_digest(seq, end))
                         if slot is not None:
                             self.gdn_plan.saves.append(GDNSaveOp(seq.seq_id, seq.gdn_slot, slot, key))
             return seqs, is_prefill

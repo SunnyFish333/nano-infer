@@ -1,6 +1,8 @@
 """HF image/video preprocessing and explicit visual intervals for the scheduler."""
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
+from struct import pack
 from pathlib import Path
 
 from PIL import Image
@@ -10,13 +12,25 @@ import torch
 from nanovllm.utils.video_processor import load_video
 
 
-@dataclass
+@dataclass(frozen=True)
 class VisualItem:
     start: int
     end: int
     grid_thw: tuple[int, int, int]
     pixel_values: torch.Tensor
     modality: str = "image"
+    content_digest: bytes = field(init=False)
+
+    def __post_init__(self):
+        pixels = self.pixel_values.detach().cpu().contiguous()
+        digest = sha256(b"nanovllm.visual.v1")
+        for value in (self.modality.encode(), pack("<3q", *self.grid_thw),
+                      str(pixels.dtype).encode(),
+                      pack("<Q", pixels.ndim) + pack(f"<{pixels.ndim}q", *pixels.shape),
+                      pixels.reshape(-1).view(torch.uint8).numpy().tobytes()):
+            digest.update(pack("<Q", len(value)))
+            digest.update(value)
+        object.__setattr__(self, "content_digest", digest.digest())
 
 
 @dataclass

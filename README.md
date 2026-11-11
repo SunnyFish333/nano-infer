@@ -41,7 +41,7 @@ Nano-Infer 面向 **Qwen 系列模型的离线文本生成与推理机制学习*
 | 🧩 **多模型适配** | 通过统一注册入口构建 Qwen3 Dense、Qwen3 MoE 与 Qwen3.5 Dense，复用调度和执行基础设施。 |
 | 🖼️ **图像与视频理解** | Qwen3.5 Dense 支持文本、单图、多图和本地视频输入，统一生成文本回答。 |
 | ⚡ **迭代式请求调度** | 按 token 预算执行 chunked prefill 与逐步解码；缓存不足时抢占请求，并通过重新预填充恢复执行。 |
-| 🗂️ **分页缓存与前缀复用** | 按块分配 KV cache，复用已有完整前缀；Qwen3.5 纯文本请求联合恢复 KV 与 GDN 状态，减少重复预填充。 |
+| 🗂️ **分页缓存与前缀复用** | 按块分配 KV cache，复用已有完整前缀；Qwen3.5 文本、图片与视频请求联合恢复 KV 与 GDN 状态，减少重复预填充。 |
 | 🔥 **CUDA 执行优化** | FlashAttention 处理注意力计算，Triton 写入 KV cache，部分算子使用 `torch.compile`；Qwen3 Dense 可启用解码 CUDA Graph。 |
 | 🌊 **混合注意力状态管理** | Qwen3.5 结合门控全注意力与 Gated DeltaNet（GDN），分别维护 KV cache、卷积历史和 FP32 递归状态。 |
 | 🔗 **单机张量并行** | 实现线性层与词表分片、NCCL 通信及多进程执行控制；具体适用范围见下表。 |
@@ -56,7 +56,7 @@ Nano-Infer 面向 **Qwen 系列模型的离线文本生成与推理机制学习*
 | :--- | :--- | :--- |
 | **Qwen3 Dense** | 离线文本生成，提供0.6B示例 | eager或Decode CUDA Graph；TP需满足模型维度的分片约束。 |
 | **Qwen3 MoE** | 实验性文本适配 | 显式设置 `enforce_eager=True`；不提供专家并行（EP）。 |
-| **Qwen3.5 Dense** | 实验性文本、图片和本地视频适配，提供0.8B统一示例 | 仅单GPU，自动使用eager；纯文本支持跨请求前缀复用，图片/视频请求不参与前缀缓存。 |
+| **Qwen3.5 Dense** | 实验性文本、图片和本地视频适配，提供0.8B统一示例 | 仅单GPU，自动使用eager；文本、单图、多图、单视频、多视频与图/视频交错输入支持同一引擎内的联合前缀复用。 |
 
 模型适配仍在完善，同系列不同 checkpoint 可能需要额外适配。建议从下方提供的单卡示例开始。
 
@@ -189,9 +189,13 @@ python example_qwen3_5.py
 
 [example_qwen3_5.py](example_qwen3_5.py) 使用 `tensor_parallel_size=1`、`max_num_seqs=1` 和 `num_gdn_slots=2`。GDN 状态池独立占用显存，扩大并发时应同时考虑槽位容量与 KV cache 预算。
 
-### Qwen3.5 纯文本前缀缓存
+### Qwen3.5 文本与多模态前缀缓存
 
-默认开启，重复或共享前缀的纯文本请求可以复用同一引擎内的 KV 和 GDN 递归状态。能复用多长，取决于两种缓存共同保留的完整块边界；图片和视频请求继续完整处理。
+默认开启，文本、单图、多图、单视频、多视频及图/视频交错请求可以复用同一引擎内的 KV 和 GDN 递归状态。复用长度取决于两种缓存共同保留的完整块边界，最后一个逻辑块仍需执行以计算 logits。
+
+缓存身份包含真实 token、完整视觉编码项的像素字节/dtype/shape/grid、媒体类型及当前块的三轴位置；64-bit 索引用累计 SHA-256 摘要核对。相同占位 token 对应不同媒体时不会误用状态。后续独立媒体变化不影响更早的共同前缀，视觉项内部的块则依赖完整项。
+
+命中后仅执行剩余语言前缀：已完全覆盖的视觉项无需重新编码；若恢复边界位于项内部，仍需完整编码该项，再注入剩余切片。请求仍会读取媒体、解码视频并运行 Processor 来确认身份；当前没有跨请求视觉特征或媒体解码缓存。
 
 通过 `LLM(model_path, **kwargs)` 选择检查点保留方式：
 
@@ -242,7 +246,7 @@ outputs = llm.generate([request], SamplingParams(temperature=0.6, max_tokens=64)
 | `max_num_seqs` | `512` | 单轮调度的序列数上限；小显存建议从1或2开始 |
 | `gpu_memory_utilization` | `0.9` | 总显存预算比例；必须留出权重、工作区和缓存空间 |
 | `num_gdn_slots` | `64` | GDN 工作状态与检查点共享的总槽数；小显存可从2开始 |
-| `enable_gdn_prefix_cache` | `True` | 开启 Qwen3.5 纯文本 KV/GDN 联合前缀复用 |
+| `enable_gdn_prefix_cache` | `True` | 开启 Qwen3.5 文本与多模态 KV/GDN 联合前缀复用 |
 | `gdn_prefix_cache_retention_interval` | `0` | 检查点保留方式：`0`、`None` 或块大小的正整数倍 |
 | `enforce_eager` | `False` | `True` 关闭执行器 CUDA Graph，局部 `torch.compile` 仍会运行；Qwen3 MoE需显式为True，GDN模型自动为True |
 | `tensor_parallel_size` | `1` | 单机GPU数，配置范围1–8，还需设备数及分片维度合法；Qwen3.5仅支持1 |

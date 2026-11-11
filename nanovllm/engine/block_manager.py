@@ -1,4 +1,6 @@
 from collections import deque
+from hashlib import sha256
+from struct import pack
 
 import xxhash
 import numpy as np
@@ -13,15 +15,18 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.prefix_digest = b""
 
-    def update(self, hash: int, token_ids: list[int]):
+    def update(self, hash: int, token_ids: list[int], prefix_digest: bytes):
         self.hash = hash
         self.token_ids = token_ids
+        self.prefix_digest = prefix_digest
 
     def reset(self):
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.prefix_digest = b""
 
 
 class BlockManager:
@@ -51,8 +56,21 @@ class BlockManager:
         while len(seq.prefix_hashes) < count:
             i = len(seq.prefix_hashes)
             parent = seq.prefix_hashes[-1] if i else -1
-            seq.prefix_hashes.append(self.compute_hash(seq.block(i), parent))
+            extras = seq.prefix_extra_keys(i * self.block_size, (i + 1) * self.block_size)
+            tokens = seq.block(i)
+            digest = sha256(b"nanovllm.prefix.v1" + (seq.prefix_digests[-1] if i else b""))
+            token_bytes = pack(f"<{len(tokens)}q", *tokens)
+            digest.update(pack("<Q", len(token_bytes)) + token_bytes)
+            digest.update(pack("<Q", len(extras)))
+            for extra in extras:
+                digest.update(pack("<Q", len(extra)) + extra)
+            seq.prefix_hashes.append(self.compute_hash(tokens, parent, extras))
+            seq.prefix_digests.append(digest.digest())
         return seq.prefix_hashes[count - 1], num_tokens
+
+    def get_prefix_digest(self, seq: Sequence, num_tokens: int) -> bytes:
+        self.get_prefix_key(seq, num_tokens)
+        return seq.prefix_digests[num_tokens // self.block_size - 1]
 
     def find_prefix_blocks(self, seq: Sequence) -> tuple[int, ...]:
         if not self.enable_prefix_cache or not seq.prefix_cacheable:
@@ -61,7 +79,8 @@ class BlockManager:
         for i in range(seq.num_blocks - 1):
             h, _ = self.get_prefix_key(seq, (i + 1) * self.block_size)
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != seq.block(i):
+            if (block_id == -1 or self.blocks[block_id].token_ids != seq.block(i)
+                    or self.blocks[block_id].prefix_digest != self.get_prefix_digest(seq, (i + 1) * self.block_size)):
                 break
             found.append(block_id)
         return tuple(found)
@@ -137,5 +156,5 @@ class BlockManager:
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h, _ = self.get_prefix_key(seq, (i + 1) * self.block_size)
-            block.update(h, token_ids)
+            block.update(h, token_ids, self.get_prefix_digest(seq, (i + 1) * self.block_size))
             self.hash_to_block_id[h] = block.block_id

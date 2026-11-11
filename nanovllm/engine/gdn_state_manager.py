@@ -9,6 +9,7 @@ class GDNSlot:
     slot_id: int
     key: tuple[int, int] | None = None
     prefix_token_ids: tuple[int, ...] = ()
+    prefix_digest: bytes = b""
     ref_count: int = 0
     status: str = "FREE"
     owner_seq_id: int | None = None
@@ -61,14 +62,16 @@ class GDNStateManager:
         interval = self.retention_interval
         return end == tail or interval is None or (interval > 0 and end % interval == 0)
 
-    def iter_checkpoints(self, seq: Sequence, max_tokens: int, get_prefix_key):
+    def iter_checkpoints(self, seq: Sequence, max_tokens: int, get_prefix_key, get_prefix_digest):
         if not self.enable_prefix_cache or not seq.prefix_cacheable:
             return
         candidates = sorted((self.slots[i] for i in self.checkpoint_index.values()),
                             key=lambda cp: cp.key[1], reverse=True)
         for cp in candidates:
             n = cp.key[1]
-            if n <= max_tokens and cp.key == get_prefix_key(seq, n) and cp.prefix_token_ids == tuple(seq[:n]):
+            if (n <= max_tokens and cp.key == get_prefix_key(seq, n)
+                    and cp.prefix_token_ids == tuple(seq[:n])
+                    and cp.prefix_digest == get_prefix_digest(seq, n)):
                 yield cp
 
     def acquire_checkpoint(self, slot: int):
@@ -84,7 +87,7 @@ class GDNStateManager:
         if cp.ref_count == 0:
             self.evictable[slot] = None
 
-    def reserve_checkpoint(self, key: tuple[int, int], token_ids: tuple[int, ...]):
+    def reserve_checkpoint(self, key: tuple[int, int], token_ids: tuple[int, ...], prefix_digest: bytes):
         if not self.enable_prefix_cache or key in self.checkpoint_index or key in self.pending_index:
             # A conflicting 64-bit identity must never replace an existing reader's state.
             return None
@@ -92,7 +95,7 @@ class GDNStateManager:
         if slot is None:
             return None
         cp = self.slots[slot]
-        cp.key, cp.prefix_token_ids = key, token_ids
+        cp.key, cp.prefix_token_ids, cp.prefix_digest = key, token_ids, prefix_digest
         cp.status = "PENDING"
         self.pending_index[key] = slot
         return slot
