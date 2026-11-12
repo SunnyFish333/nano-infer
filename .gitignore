@@ -217,5 +217,7 @@ logs/
 /QWEN3_5_ADAPTATION_PLAN.md
 /GDN_UNIFIED_POOL_PLAN.md
 /MULTIMODAL_PREFIX_CACHING_PLAN.md
+/MTP_SPECULATIVE_DECODING_TEMP_PLAN.md
+/CODE_CLEANUP_TEMP.md
 # The test workflow depends on local-only test sources.
 /.github/workflows/tests.yml
