@@ -47,7 +47,6 @@ class ImageProcessor:
         self.processor = processor
 
     def process(self, request):
-
         messages = deepcopy(request["messages"])
         images, videos, metadata = [], [], []
         for message in messages:
@@ -68,7 +67,7 @@ class ImageProcessor:
                     videos.append(frames)
                     metadata.append(info)
         text = self.processor.apply_chat_template(messages, tokenize=False,
-                    add_generation_prompt=True, enable_thinking=False)
+                                                  add_generation_prompt=True, enable_thinking=False)
         kwargs = dict(text=[text], return_tensors="pt", padding=False,
                       images_kwargs={"size": {"shortest_edge": 32 * 32,
                                                "longest_edge": self.config.max_image_pixels}})

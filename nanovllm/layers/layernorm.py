@@ -55,6 +55,7 @@ class RMSNorm(nn.Module):
         output, residual = self.add_rms_forward(x, residual)
         return output.reshape(shape), residual.reshape(shape)
 
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -81,7 +82,7 @@ class GemmaRMSNorm(nn.Module):
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(weight.dtype).mul_(weight) 
+        x = x.to(weight.dtype).mul_(weight)
         return x.to(orig_dtype)
 
     @torch.compile
@@ -118,23 +119,25 @@ class GemmaRMSNorm(nn.Module):
         output, residual = self.add_rms_forward(x, residual, weight)
         return output.reshape(shape), residual.reshape(shape)
 
+
 class RMSNormGated(nn.Module):
+
     def __init__(
-            self, 
-            hidden_size: int, 
-            eps: float = 1e-6, 
-            **kwargs
-        ) -> None:
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        **kwargs
+    ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.activation = "silu"
 
     def forward(
-            self, 
-            hidden_states: torch.Tensor, 
-            gate: torch.Tensor
-        ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        gate: torch.Tensor
+    ) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

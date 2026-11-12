@@ -9,10 +9,10 @@ from nanovllm.utils.context import get_context
 
 
 def l2norm(
-        x: torch.Tensor, 
-        dim: int = -1, 
-        eps: float = 1e-6
-    ) -> torch.Tensor:
+    x: torch.Tensor,
+    dim: int = -1,
+    eps: float = 1e-6
+) -> torch.Tensor:
     # 与 FLA 库一致: x / sqrt(sum(x^2) + eps)
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
