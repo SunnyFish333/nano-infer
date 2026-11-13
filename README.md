@@ -42,7 +42,7 @@ Nano-Infer 面向 **Qwen 系列模型的离线文本生成与推理机制学习*
 | 🖼️ **图像与视频理解** | Qwen3.5 Dense 支持文本、单图、多图和本地视频输入，统一生成文本回答。 |
 | ⚡ **迭代式请求调度** | 按 token 预算执行 chunked prefill 与逐步解码；缓存不足时抢占请求，并通过重新预填充恢复执行。 |
 | 🗂️ **分页缓存与前缀复用** | 按块分配 KV cache，复用已有完整前缀；Qwen3.5 文本、图片与视频请求联合恢复 KV 与 GDN 状态，减少重复预填充。 |
-| 🔥 **CUDA 执行优化** | FlashAttention 处理注意力计算，Triton 写入 KV cache，部分算子使用 `torch.compile`；Qwen3 Dense 可启用解码 CUDA Graph。 |
+| 🔥 **CUDA 执行优化** | FlashAttention 处理注意力计算，Triton 写入 KV cache及执行GDN短窗口，部分算子使用torch.compile；Qwen3 Dense可启用解码Graph，Qwen3.5可显式启用阶段Graph。 |
 | 🌊 **混合注意力状态管理** | Qwen3.5 结合门控全注意力与 Gated DeltaNet（GDN），分别维护 KV cache、卷积历史和 FP32 递归状态。 |
 | 🔗 **单机张量并行** | 实现线性层与词表分片、NCCL 通信及多进程执行控制；具体适用范围见下表。 |
 
@@ -56,11 +56,11 @@ Nano-Infer 面向 **Qwen 系列模型的离线文本生成与推理机制学习*
 | :--- | :--- | :--- |
 | **Qwen3 Dense** | 离线文本生成，提供0.6B示例 | eager或Decode CUDA Graph；TP需满足模型维度的分片约束。 |
 | **Qwen3 MoE** | 实验性文本适配 | 显式设置 `enforce_eager=True`；不提供专家并行（EP）。 |
-| **Qwen3.5 Dense** | 实验性文本、图片和本地视频适配，提供0.8B统一示例 | 仅单GPU，自动使用eager；文本、单图、多图、单视频、多视频与图/视频交错输入支持同一引擎内的联合前缀复用。 |
+| **Qwen3.5 Dense** | 实验性文本、图片和本地视频适配，提供0.8B统一示例 | 仅单GPU，默认eager，可显式启用阶段Graph；文本、单图、多图、单视频、多视频与图/视频交错输入支持联合前缀复用。 |
 
 模型适配仍在完善，同系列不同 checkpoint 可能需要额外适配。建议从下方提供的单卡示例开始。
 
-当前入口为同步、离线 Python API。Qwen3.5 Dense 支持图像和本地视频输入，以及显式开启的实验性纯文本 MTP 投机解码；尚未提供 Qwen3.5 MoE、张量并行及 CUDA Graph。当前引擎也未提供 HTTP 服务、流式生成或量化。
+当前入口为同步、离线 Python API。Qwen3.5 Dense 支持图像和本地视频输入，以及显式开启的实验性纯文本 MTP 投机解码；尚未提供 Qwen3.5 MoE或张量并行。当前引擎也未提供 HTTP 服务、流式生成或量化。
 
 <a id="quickstart"></a>
 <a name="quick-start"></a>
@@ -187,19 +187,26 @@ hf download Qwen/Qwen3.5-0.8B --local-dir "$HOME/huggingface/Qwen3.5-0.8B"
 python example_qwen3_5.py
 ```
 
-[example_qwen3_5.py](example_qwen3_5.py) 使用 `tensor_parallel_size=1`、`max_num_seqs=1` 和 `num_gdn_slots=2`。GDN 状态池独立占用显存，扩大并发时应同时考虑槽位容量与 KV cache 预算。
+[example_qwen3_5.py](example_qwen3_5.py) 使用 `tensor_parallel_size=1`、`max_num_seqs=1`。默认按字节预算自动规划GDN和KV容量，通常无需指定GDN槽位数。
 
 ### Qwen3.5 MTP 投机解码
 
-官方完整 BF16 Qwen3.5-0.8B 权重可启用单层 MTP，要求单 GPU、`enforce_eager=True`。支持多候选、greedy、温度拒绝采样及逐位置 GDN/卷积状态回退。
+官方完整 BF16 Qwen3.5-0.8B 权重可启用单层 MTP，要求单 GPU。支持多候选、greedy、温度拒绝采样及逐位置 GDN/卷积状态回退；可选择 eager 或显式开启分阶段 CUDA Graph。
 
 ```bash
 python example_qwen3_5.py --mtp --speculative-tokens 2 --temperature 0
+python example_qwen3_5.py --mtp --speculative-tokens 2 --temperature 0 --cuda-graph
 ```
 
 API 通过 `LLM(model_path, enable_mtp=True, enforce_eager=True, num_speculative_tokens=2, speculative_max_batch_size=2)` 开启。默认关闭；启用时必须包含全部 MTP 权重。MTP 文本请求关闭跨请求前缀复用，图像/视频请求继续普通解码及原前缀策略。
 
-工作状态、检查点及逐位置投机快照共用 `num_gdn_slots`。单请求完整 K 窗口需要一个工作槽和 K+1 个临时槽；不足时缩短窗口或普通解码。MTP 权重、额外 KV 层与工作区会减少同预算下的 KV block 容量。当前 Verify 按请求执行，GDN 使用 PyTorch 短窗口扫描；收益取决于接受率、并发与硬件，K 较大可能更慢。
+工作状态、检查点及逐位置投机快照共用 GDN 池。单请求完整 K 窗口需要一个工作槽和 K+1 个临时槽；不足时缩短窗口或普通解码。MTP 权重、额外 KV 层与工作区会减少同预算下的 KV block 容量。默认按阶段批量 Draft/Verify/Sync，CUDA Verify 使用融合 GDN 短窗口扫描；保留参考路径以便对照。收益取决于接受率、并发与硬件，K 较大可能更慢。
+
+默认 `adaptive_speculation=True` 在候选上限内探索窗口，并根据已完成GPU事件的完整投机轮成本/输出量做平滑选择，按批量负载分组；资源准入仍是硬约束。`adaptive_speculation=False` 或示例 `--fixed-k` 用于固定候选上限的对照。K=0仍维护MTP历史，完全关闭MTP使用 `enable_mtp=False`。
+
+启用Graph使用 `enforce_eager=False, enable_gdn_cuda_graph=True`，`cuda_graph_max_batch_size`控制捕获批量上限。普通GDN decode、MTP Verify及MTP模块的固定形状桶可重放，超出捕获范围的输入回退eager。采样和CPU提交在Graph外；padding使用池内独占GRAPH槽，不写活动请求状态。Graph工作区和该槽均计入预算。当前仍只支持TP=1，`reference_numerics=True`不支持此Graph路径。
+
+`num_gdn_slots=None`为默认自动模式：按模型真实状态尺寸、并发、上下文和投机需求规划两池。在 `generate()` 开始且没有活动请求时，可根据实际批次重新配比；只有容量差异足够大才释放空闲缓存并重建，Graph同时重捕获。重新配比会使原前缀缓存失效，冷调用耗时包含此成本。活动请求期间不迁移状态；增量`add_request()`沿用当前容量和资源准入。`adapt_cache_to_workload=False`关闭批次间重配；显式整数`num_gdn_slots`固定GDN容量并关闭自动重配。
 
 调度统计位于 `llm.scheduler.speculative_metrics`，包含候选/接受/decode实际输出数、拒绝位置、回退原因和资源峰值。`llm.model_runner.collect_mtp_metrics()` 返回已完成事件的 bootstrap/Draft/Verify/sync GPU 毫秒数；未完成事件延后收集，不在逐 token 路径中同步整个设备。Verify 计时包含 GDN 状态 I/O。
 
@@ -259,13 +266,18 @@ outputs = llm.generate([request], SamplingParams(temperature=0.6, max_tokens=64)
 | `max_num_batched_tokens` | `16384` | 单轮输入 token 预算，MTP Verify 计入 K+1；较长输入会分块处理 |
 | `max_num_seqs` | `512` | 单轮调度的序列数上限；小显存建议从1或2开始 |
 | `gpu_memory_utilization` | `0.9` | 总显存预算比例；必须留出权重、工作区和缓存空间 |
-| `num_gdn_slots` | `64` | GDN 工作状态、检查点与投机快照共享的总槽数；普通模式小显存可从2开始 |
-| `enable_mtp` | `False` | 实验性 Qwen3.5 Dense 单层纯文本 MTP，要求 TP=1、eager |
+| `num_gdn_slots` | `None` | 自动规划；整数可覆盖GDN工作状态、检查点、快照及Graph保留槽的总容量 |
+| `adapt_cache_to_workload` | `True` | 自动模式在无活动请求的generate批次边界按负载重配，可能使前缀缓存失效 |
+| `enable_mtp` | `False` | 实验性 Qwen3.5 Dense 单层纯文本 MTP，要求 TP=1 |
+| `mtp_batch_execution` | `True` | 批量MTP执行；False保留逐请求参考路径 |
+| `adaptive_speculation` | `True` | 根据完整投机轮GPU反馈选择窗口，始终不超过候选上限 |
+| `enable_gdn_cuda_graph` | `False` | 显式开启Qwen3.5阶段Graph，要求enforce_eager=False |
+| `cuda_graph_max_batch_size` | `8` | GDN阶段Graph最大捕获批量，更大批次回退eager |
 | `num_speculative_tokens` | `1` | 每请求候选上限；0 使用目标单步并维护 MTP 上下文 |
 | `speculative_max_batch_size` | `1` | 本轮参与投机的请求上限，其余请求普通解码 |
 | `enable_gdn_prefix_cache` | `True` | 开启 Qwen3.5 文本与多模态 KV/GDN 联合前缀复用 |
 | `gdn_prefix_cache_retention_interval` | `0` | 检查点保留方式：`0`、`None` 或块大小的正整数倍 |
-| `enforce_eager` | `False` | `True` 关闭执行器 CUDA Graph，局部 `torch.compile` 仍会运行；Qwen3 MoE需显式为True，GDN模型自动为True |
+| `enforce_eager` | `False` | `True`关闭执行器Graph，局部torch.compile仍运行；Qwen3 MoE需为True，GDN默认eager并可显式启用阶段Graph |
 | `tensor_parallel_size` | `1` | 单机GPU数，配置范围1–8，还需设备数及分片维度合法；Qwen3.5仅支持1 |
 
 显存不足时可先降低上下文长度、单轮 token 预算、并发数和 GDN 槽位；多模态请求还可降低图片像素上限和视频帧数。`enforce_eager=True` 可减少 Graph 捕获开销，但不能保证任意模型适配显存。每个独立进程建议只运行一个引擎。

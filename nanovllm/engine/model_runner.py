@@ -12,13 +12,16 @@ from nanovllm.models.registry import build_model
 from nanovllm.layers.sampler import Sampler
 from nanovllm.layers.sampler import probabilities, sample_probs
 from nanovllm.layers.rejection_sampler import rejection_sample
-from nanovllm.engine.speculative import DraftOutput, VerifyOutput, SpeculativeResult
+from nanovllm.engine.speculative import DraftOutput, VerifyOutput, SpeculativeResult, TargetForwardOutput
+from nanovllm.engine.mtp_runner import BatchedMTPRunner
+from nanovllm.engine.cache_budget import plan_cache_budget
+from nanovllm.engine.stage_graphs import StageGraphs
 from nanovllm.layers.gdn_attention import GDNAttention
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
-class ModelRunner:
+class ModelRunner(BatchedMTPRunner):
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -33,6 +36,7 @@ class ModelRunner:
         self.mtp_profile_events = []
         self.mtp_gpu_times = {}
         self.profile_state_io = False
+        self.mtp_observations = []
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -52,7 +56,9 @@ class ModelRunner:
             config.has_gdn = bool(self.gdn_layers)
             if config.has_gdn:
                 assert self.world_size == 1, 'GDN state scheduling v1 requires tensor_parallel_size=1'
-                self.enforce_eager = config.enforce_eager = True
+                self.enforce_eager = True  # Legacy graph path; Qwen3.5 uses explicit stage graphs.
+                if not getattr(config, "enable_gdn_cuda_graph", False):
+                    config.enforce_eager = True
             load_model(self.model, config.model)
             self.sampler = Sampler()
             self.warmup_model()
@@ -63,10 +69,21 @@ class ModelRunner:
                 self.workspace_bytes += (4 * config.max_num_batched_tokens * hf_config.hidden_size
                                          * hf_config.dtype.itemsize
                                          + 2 * config.max_num_seqs * hf_config.hidden_size * hf_config.dtype.itemsize
-                                         + 3 * (config.num_speculative_tokens + 1) * hf_config.vocab_size * 4)
+                                         + 3 * (config.num_speculative_tokens + 1) * hf_config.vocab_size * 4
+                                         * min(config.speculative_max_batch_size, config.max_num_seqs))
             self.warmup_vision()
+            if getattr(config, "enable_gdn_cuda_graph", False):
+                first = self.gdn_layers[0]
+                batch = min(config.cuda_graph_max_batch_size, config.max_num_seqs, config.max_num_batched_tokens)
+                self.workspace_bytes += (2 * len(self.gdn_layers) * batch * first.num_v_heads
+                                         * first.head_k_dim * first.head_v_dim * 4 + 32*1024**2)
             self.allocate_gdn_cache()
             self.allocate_kv_cache()
+            if getattr(config, "enable_gdn_cuda_graph", False):
+                self.kv_cache[:, :, 0].zero_()
+                before_graph = torch.cuda.memory_allocated()
+                self.stage_graphs = StageGraphs(self.model, config)
+                self.stage_graph_bytes = torch.cuda.memory_allocated() - before_graph
             if not self.enforce_eager:
                 self.capture_cudagraph()
         except BaseException:
@@ -97,11 +114,12 @@ class ModelRunner:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         self.collect_mtp_metrics()
+        self.drain_speculation_observations()
         dist.destroy_process_group()
         # Linear parameters carry bound loader methods, so model objects can form
         # cycles. Release pools and collect them before constructing another engine.
         for name in ("model", "gdn_layers", "target_attention_layers", "draft_attention_layers",
-                     "kv_cache", "conv_cache", "ssm_cache"):
+                     "kv_cache", "conv_cache", "ssm_cache", "stage_graphs"):
             self.__dict__.pop(name, None)
         gc.collect()
         torch.cuda.empty_cache()
@@ -222,9 +240,44 @@ class ModelRunner:
         self.ssm_cache = None
         if not self.gdn_layers:
             return
-        capacity = self.config.num_gdn_slots
         num_layers = len(self.gdn_layers)
         first_layer = self.gdn_layers[0]
+        if self.config.num_gdn_slots is None:
+            slot_bytes = num_layers * (
+                first_layer.conv_dim * (first_layer.conv_kernel_size - 1) * first_layer.conv1d.weight.element_size()
+                + first_layer.num_v_heads * first_layer.head_k_dim * first_layer.head_v_dim * 4)
+            target = [module for module in self.model.model.modules()
+                      if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
+            draft = ([layer.self_attn.attn for layer in self.model.mtp.layers]
+                     if self.config.enable_mtp else [])
+            attention = target + draft
+            first = attention[0]
+            block_bytes = (2 * len(attention) * self.block_size * first.num_kv_heads * first.head_dim
+                           * first_layer.conv1d.weight.element_size())
+            free, total = torch.cuda.mem_get_info()
+            budget = int(total * self.config.gpu_memory_utilization) - (total - free) - self.workspace_bytes
+            length, concurrency, spec_batch = getattr(self, "cache_workload", (
+                self.config.max_model_len, self.config.max_num_seqs, self.config.speculative_max_batch_size))
+            plan = plan_cache_budget(budget, slot_bytes, block_bytes, self.block_size,
+                                     length, concurrency,
+                                     enable_mtp=self.config.enable_mtp,
+                                     max_spec_batch=spec_batch,
+                                     k=min(self.config.num_speculative_tokens,
+                                           self.config.max_num_batched_tokens - 1,
+                                           self.config.max_model_len - 1),
+                                     reserved_slots=int(getattr(self.config, "enable_gdn_cuda_graph", False)),
+                                     checkpoint_requests=getattr(self, "checkpoint_workload",
+                                         self.config.max_num_seqs if self.config.enable_gdn_prefix_cache
+                                         and not self.config.enable_mtp else 0))
+            self.config.num_gdn_slots = plan.gdn_slots
+            self.config.cache_plan = plan.to_dict()
+            self.config.cache_plan.update(workload_context_len=length, workload_requests=concurrency)
+            self.workspace_bytes += plan.safety_bytes
+            self.cache_safety_bytes = plan.safety_bytes
+        capacity = self.config.num_gdn_slots
+        if getattr(self.config, "enable_gdn_cuda_graph", False):
+            assert capacity >= 2, "GDN graphs require a working slot and a reserved padding slot"
+            self.config.gdn_graph_slot = capacity - 1
         conv_shape = (capacity, first_layer.conv_dim, first_layer.conv_kernel_size - 1)
         ssm_shape = (capacity, first_layer.num_v_heads, first_layer.head_k_dim, first_layer.head_v_dim)
         conv_dtype = first_layer.conv1d.weight.dtype
@@ -236,6 +289,9 @@ class ModelRunner:
         free, total = torch.cuda.mem_get_info()
         budget = int(total * self.config.gpu_memory_utilization) - (total - free) - self.workspace_bytes
         assert required_bytes <= budget, 'GDN state pools exceed the memory budget; reduce num_gdn_slots'
+        # Keep a single byte budget across both allocations. Driver free-memory
+        # queries may include allocator retention and need not track each tensor.
+        self.cache_allocation_budget = budget
         # 与 KV cache 一样，统一按 [层, ...] 开辟；各层持有对应切片的视图。
         conv_cache = torch.zeros(num_layers, *conv_shape, dtype=conv_dtype, device="cuda")
         ssm_cache = torch.zeros(num_layers, *ssm_shape, dtype=torch.float32, device="cuda")
@@ -262,13 +318,82 @@ class ModelRunner:
         assert not any((layer.num_kv_heads != num_kv_heads or layer.head_dim != head_dim for layer in attention_layers)), 'Full-attention layers must have matching KV head layouts'
         dtype = torch.get_default_dtype()
         block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - self.workspace_bytes) // block_bytes
+        budget = int(total * config.gpu_memory_utilization - used - self.workspace_bytes)
+        if self.gdn_layers and hasattr(self, "cache_allocation_budget"):
+            state_bytes = sum(pool.numel()*pool.element_size() for pool in (self.conv_cache, self.ssm_cache))
+            budget = self.cache_allocation_budget - state_bytes
+        config.num_kvcache_blocks = budget // block_bytes
         assert config.num_kvcache_blocks > 0
+        if hasattr(config, "cache_plan"):
+            config.cache_plan.update(actual_gdn_slots=config.num_gdn_slots,
+                                     actual_kv_blocks=config.num_kvcache_blocks,
+                                     actual_kv_block_bytes=block_bytes)
         self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks, self.block_size,
                                     num_kv_heads, head_dim, dtype=dtype, device="cuda")
         for layer_id, module in enumerate(attention_layers):
             module.k_cache = self.kv_cache[0, layer_id]
             module.v_cache = self.kv_cache[1, layer_id]
+
+    @torch.inference_mode()
+    def rebalance_idle_cache(self, length, concurrency, spec_batch, checkpoint_requests=0):
+        """Resize only with no active requests; all old prefix identities are invalidated.
+
+        The engine replaces its empty Scheduler after success. Active workloads never
+        migrate states or change addresses; stage graphs are recaptured after resizing.
+        """
+        config = self.config
+        self.cache_workload = (min(length, config.max_model_len), min(concurrency, config.max_num_seqs), spec_batch)
+        self.checkpoint_workload = checkpoint_requests
+        config.cache_plan.update(last_workload_context_len=self.cache_workload[0],
+                                 last_workload_requests=self.cache_workload[1])
+        slot_bytes = sum(pool.numel()*pool.element_size() for pool in (self.conv_cache, self.ssm_cache)) // config.num_gdn_slots
+        block_bytes = self.kv_cache.numel()*self.kv_cache.element_size() // config.num_kvcache_blocks
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        releasable = sum(pool.numel()*pool.element_size() for pool in (self.conv_cache, self.ssm_cache, self.kv_cache))
+        budget = (int(total*config.gpu_memory_utilization) - (total-free) + releasable
+                  + getattr(self, "stage_graph_bytes", 0) - self.workspace_bytes
+                  + getattr(self, "cache_safety_bytes", 0))
+        desired = plan_cache_budget(budget, slot_bytes, block_bytes, self.block_size,
+            self.cache_workload[0], self.cache_workload[1], enable_mtp=config.enable_mtp,
+            max_spec_batch=spec_batch,
+            k=min(config.num_speculative_tokens, config.max_num_batched_tokens-1, config.max_model_len-1),
+            reserved_slots=int(config.enable_gdn_cuda_graph), checkpoint_requests=checkpoint_requests)
+        minimum = (desired.target_concurrency + desired.speculative_slots
+                   + int(config.enable_gdn_cuda_graph) + int(desired.checkpoint_slots > 0))
+        if (config.num_gdn_slots >= minimum and
+                abs(desired.gdn_slots-config.num_gdn_slots) < max(2, config.num_gdn_slots//4)):
+            return False
+        torch.cuda.synchronize()  # Rare idle reconfiguration, never the per-token path.
+        self.collect_mtp_metrics()
+        self.drain_speculation_observations()
+        for layer in self.target_attention_layers + self.draft_attention_layers:
+            layer.k_cache = layer.v_cache = torch.tensor([], device="cuda")
+        for layer in self.gdn_layers:
+            layer.conv_pool = layer.ssm_pool = torch.tensor([], device="cuda")
+        for name in ("stage_graphs", "kv_cache", "conv_cache", "ssm_cache"):
+            self.__dict__.pop(name, None)
+        self.stage_graph_bytes = 0
+        self.mtp_requests.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.workspace_bytes -= getattr(self, "cache_safety_bytes", 0)
+        config.num_gdn_slots = None
+        dtype, device = torch.get_default_dtype(), torch.get_default_device()
+        try:
+            torch.set_default_dtype(config.text_config.dtype)
+            torch.set_default_device("cuda")
+            self.allocate_gdn_cache()
+            self.allocate_kv_cache()
+            if config.enable_gdn_cuda_graph:
+                self.kv_cache[:, :, 0].zero_()
+                before = torch.cuda.memory_allocated()
+                self.stage_graphs = StageGraphs(self.model, config)
+                self.stage_graph_bytes = torch.cuda.memory_allocated()-before
+        finally:
+            torch.set_default_device(str(device))
+            torch.set_default_dtype(dtype)
+        return True
 
     def prepare_gdn_context(self, seqs: list[Sequence], is_prefill: bool):
         if not self.gdn_layers or self.gdn_layers[0].ssm_pool.numel() == 0:
@@ -364,6 +489,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, visual=None):
+        if not is_prefill and hasattr(self, "stage_graphs"):
+            hidden = self.stage_graphs.replay("decode", input_ids, positions)
+            if hidden is not None:
+                return self.model.compute_logits(hidden)
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             hidden = self.model(input_ids, positions, *visual) if visual is not None else self.model(input_ids, positions)
             return self.model.compute_logits(hidden)
@@ -384,6 +513,8 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool, gdn_plan=None, speculative_plans=None):
         if not is_prefill and any(getattr(seq, "mtp_enabled", False) for seq in seqs):
+            if getattr(self.config, "mtp_batch_execution", False):
+                return self.run_speculative_batch(seqs, gdn_plan, speculative_plans or {})
             return self.run_speculative(seqs, gdn_plan, speculative_plans or {})
         return self._run_normal(seqs, is_prefill, gdn_plan)
 
@@ -470,7 +601,7 @@ class ModelRunner:
 
     def sync_mtp(self, seq, hidden, successors, start):
         ids, positions = self.prepare_window(seq, start, successors, "sync")
-        output = self.model.mtp(self.model.model.language_model.embed_tokens(ids), positions, hidden)
+        output = self.run_mtp_module(ids, positions, hidden)
         self.mtp_state(seq)["seed"] = output[-1:].clone()
         seq.draft_cached_len = seq.draft_spec_end = start + len(successors)
 
@@ -514,7 +645,7 @@ class ModelRunner:
                 break
             if i + 1 < plan.k:
                 ids, pos = self.prepare_window(seq, plan.draft_start + i, [token], "draft")
-                hidden = self.model.mtp(self.model.model.language_model.embed_tokens(ids), pos, hidden)
+                hidden = self.run_mtp_module(ids, pos, hidden)
         end = plan.draft_start + max(0, len(candidates) - 1)
         seq.draft_spec_end = end
         vocab = self.config.text_config.vocab_size
@@ -582,8 +713,23 @@ class ModelRunner:
             reset_context()
 
     def verify_target(self, input_ids, positions, slots):
-        output = self.model.forward_target(input_ids, positions)
+        output = self.target_output(input_ids, positions)
         return VerifyOutput(self.model.lm_head.project(output.logit_hidden), output.mtp_hidden, slots, True)
+
+    def target_output(self, input_ids, positions):
+        if hasattr(self, "stage_graphs"):
+            mode = "verify" if get_context().mode == "verify" else "decode"
+            hidden = self.stage_graphs.replay(mode, input_ids, positions)
+            if hidden is not None:
+                return TargetForwardOutput(hidden, hidden)
+        return self.model.forward_target(input_ids, positions)
+
+    def run_mtp_module(self, ids, positions, hidden):
+        if hasattr(self, "stage_graphs"):
+            output = self.stage_graphs.replay("mtp", ids, positions, hidden)
+            if output is not None:
+                return output
+        return self.model.mtp(self.model.model.language_model.embed_tokens(ids), positions, hidden)
 
     def copy_gdn_states(self, plan, restore: bool):
         operations = ([(op.checkpoint_slot, op.working_slot) for op in plan.restores]

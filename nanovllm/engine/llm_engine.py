@@ -73,6 +73,8 @@ class LLMEngine:
         return seq, items
 
     def enqueue_request(self, seq):
+        if getattr(self, "_cache_reconfiguration_failed", False):
+            raise RuntimeError("Cache reconfiguration failed; close and recreate this engine")
         self.scheduler.add(seq)
         return seq.seq_id
 
@@ -82,6 +84,8 @@ class LLMEngine:
         self.model_runner.release_visual([seq.seq_id for seq in seqs])
 
     def step(self):
+        if getattr(self, "_cache_reconfiguration_failed", False):
+            raise RuntimeError("Cache reconfiguration failed; close and recreate this engine")
         try:
             schedule_start = perf_counter()
             seqs, is_prefill = self.scheduler.schedule()
@@ -94,6 +98,8 @@ class LLMEngine:
             token_ids = (self.model_runner.call("run", seqs, is_prefill, plan, speculative) if speculative else
                          self.model_runner.call("run", seqs, is_prefill, plan) if plan is not None
                          else self.model_runner.call("run", seqs, is_prefill))
+            if getattr(self.scheduler, "enable_mtp", False):
+                self.scheduler.observe_speculation(self.model_runner.drain_speculation_observations())
             commit_start = perf_counter()
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
             if getattr(self.scheduler, "enable_mtp", False):
@@ -114,6 +120,29 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def rebalance_for_requests(self, seqs):
+        config = getattr(self, "config", None)
+        if (not seqs or not config or not getattr(config, "auto_gdn_cache", False)
+                or not config.has_gdn or not config.adapt_cache_to_workload or not self.scheduler.is_finished()):
+            return False
+        assert self.scheduler.gdn_plan is None or self.scheduler.gdn_plan.closed
+        length = max(len(seq) + seq.max_tokens for seq in seqs)
+        speculative = min(config.speculative_max_batch_size, sum(not seq.visual_spans for seq in seqs))
+        checkpoints = (sum(seq.prefix_cacheable and not (config.enable_mtp and not seq.visual_spans)
+                           for seq in seqs) if getattr(config, "enable_gdn_prefix_cache", False) else 0)
+        try:
+            changed = self.model_runner.rebalance_idle_cache(length, len(seqs), speculative, checkpoints)
+        except BaseException:
+            self._cache_reconfiguration_failed = True
+            raise
+        if changed:
+            metrics = self.scheduler.speculative_metrics.copy()
+            metrics["cache_prefix_invalidations"] += len(self.scheduler.block_manager.hash_to_block_id)
+            self.scheduler = Scheduler(config)
+            self.scheduler.speculative_metrics.update(metrics)
+            self.scheduler.speculative_metrics["cache_rebalances"] += 1
+        return changed
+
     def generate(
         self,
         prompts: list[str | list[int] | dict],
@@ -123,6 +152,7 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         prepared = [self.prepare_request(prompt, sp) for prompt, sp in zip(prompts, sampling_params)]
+        self.rebalance_for_requests([seq for seq, _ in prepared])
         for seq, items in prepared:
             if items:
                 self.model_runner.register_visual(seq.seq_id, items)

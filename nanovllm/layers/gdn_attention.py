@@ -6,6 +6,7 @@ from torch import nn
 from nanovllm.layers.layernorm import RMSNormGated
 from nanovllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from nanovllm.utils.context import get_context
+from nanovllm.layers.gdn_verify import fused_verify
 
 
 def l2norm(
@@ -210,6 +211,7 @@ class GDNAttention(nn.Module):
 
         # 占位；model_runner 按 GDN 层顺序绑定统一缓存张量的逐层视图。
         self.conv_pool = self.ssm_pool = torch.tensor([])
+        self.use_fused_verify = head_k_dim <= 128 and head_v_dim <= 128 and conv_kernel_size <= 4
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
@@ -227,7 +229,12 @@ class GDNAttention(nn.Module):
         assert not warmup or context.is_prefill, 'GDN decode requires initialized state caches; warmup supports prefill only'
         assert warmup or context.gdn_slots is not None, 'GDN execution requires context.gdn_slots'
         if context.mode == "verify":
-            core = self._verify_segments(mixed_qkv, g, beta, context.gdn_verify_segments)
+            if (mixed_qkv.is_cuda and mixed_qkv.dtype in (torch.float32, torch.bfloat16)
+                    and self.use_fused_verify and context.gdn_verify_destinations is not None):
+                core = fused_verify(self, mixed_qkv, g, beta, context.cu_seqlens_q,
+                                    context.gdn_slots, context.gdn_verify_destinations)
+            else:
+                core = self._verify_segments(mixed_qkv, g, beta, context.gdn_verify_segments)
         elif context.is_prefill:
             assert context.cu_seqlens_q is not None, 'GDN prefill requires context.cu_seqlens_q'
             cu = context.cu_seqlens_q.tolist()

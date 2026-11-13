@@ -45,7 +45,8 @@ class GDNStateManager:
     """CPU ownership and prefix metadata; ModelRunner owns all GPU tensors."""
 
     def __init__(self, capacity: int, block_size: int = 256,
-                 enable_prefix_cache: bool = False, retention_interval: int | None = 0):
+                 enable_prefix_cache: bool = False, retention_interval: int | None = 0,
+                 reserved_slots: tuple[int, ...] = ()):
         assert capacity > 0
         self.free_slots = deque(range(capacity))
         self.used_slots: set[int] = set()
@@ -56,6 +57,9 @@ class GDNStateManager:
         self.checkpoint_index: dict[tuple[int, int], int] = {}
         self.pending_index: dict[tuple[int, int], int] = {}
         self.evictable: OrderedDict[int, None] = OrderedDict()
+        for slot in reserved_slots:
+            self.free_slots.remove(slot)
+            self.slots[slot].status = "GRAPH"
 
     def should_retain(self, seq: Sequence, end: int) -> bool:
         if not self.enable_prefix_cache or not seq.prefix_cacheable or end <= 0 or end % self.block_size:

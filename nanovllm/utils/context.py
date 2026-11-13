@@ -19,6 +19,7 @@ class Context:
     mode: str = "normal"
     gdn_verify_segments: list[tuple[int, int, int, tuple[int, ...]]] | None = None
     state_io_events: list | None = None  # Optional diagnostic profiling; never synchronizes here.
+    gdn_verify_destinations: torch.Tensor | None = None
 
 
 _CONTEXT = Context()
@@ -42,12 +43,13 @@ def set_context(
     mode="normal",
     gdn_verify_segments=None,
     state_io_events=None,
+    gdn_verify_destinations=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
         is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         slot_mapping, context_lens, block_tables, gdn_slots, gdn_has_initial,
-        mode, gdn_verify_segments, state_io_events,
+        mode, gdn_verify_segments, state_io_events, gdn_verify_destinations,
     )
 
 

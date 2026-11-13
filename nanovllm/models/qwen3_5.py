@@ -178,6 +178,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 head_v_dim=config.linear_value_head_dim,
                 conv_kernel_size=config.linear_conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps)
+            self.linear_attn.use_fused_verify &= not getattr(config, "reference_numerics", False)
         else:
             assert False, f"Unsupported Qwen3.5 layer type: {self.layer_type!r}"
         self.mlp = Qwen3_5MLP(config)

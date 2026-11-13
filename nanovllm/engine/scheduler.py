@@ -4,6 +4,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.speculative import SpeculativeStepPlan, SpeculativeResult
+from nanovllm.engine.speculation_policy import SpeculationPolicy
 from nanovllm.engine.gdn_state_manager import (
     GDNStateManager, GDNStepPlan, GDNRestoreOp, GDNSaveOp,
 )
@@ -23,6 +24,7 @@ class Scheduler:
             config.num_gdn_slots,
             self.block_size, self.gdn_prefix_enabled,
             getattr(config, "gdn_prefix_cache_retention_interval", 0),
+            reserved_slots=((config.gdn_graph_slot,) if getattr(config, "gdn_graph_slot", -1) >= 0 else ()),
         ) if config.has_gdn else None)
         self.gdn_plan: GDNStepPlan | None = None
         self._step_seqs: list[Sequence] = []
@@ -33,6 +35,7 @@ class Scheduler:
         self.speculative_plans = {}
         self._step_id = 0
         self.speculative_metrics = Counter()
+        self.speculation_policy = SpeculationPolicy() if getattr(config, "adaptive_speculation", False) else None
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -107,10 +110,19 @@ class Scheduler:
         self.gdn_plan = GDNStepPlan() if self.gdn_prefix_enabled else None
         self._step_seqs = []
         self.speculative_plans = {}
+        self._policy_choices = {}
         self._step_id += 1
         try:
             seqs, is_prefill = self._schedule()
             if self.enable_mtp:
+                self.speculative_metrics["kv_free_blocks"] = len(self.block_manager.free_block_ids)
+                self.speculative_metrics["kv_used_blocks"] = len(self.block_manager.used_block_ids)
+                states = self.gdn_state_manager.slots
+                self.speculative_metrics["gdn_free_slots"] = len(self.gdn_state_manager.free_slots)
+                self.speculative_metrics["gdn_working_slots"] = sum(slot.status == "WORKING" for slot in states)
+                self.speculative_metrics["gdn_speculative_slots"] = sum(slot.status == "SPECULATIVE" for slot in states)
+                self.speculative_metrics["gdn_evictable_slots"] = len(self.gdn_state_manager.evictable)
+                self.speculative_metrics["gdn_protected_slots"] = sum(slot.status == "READY" and slot.ref_count > 0 for slot in states)
                 self.speculative_metrics["peak_kv_blocks"] = max(
                     self.speculative_metrics["peak_kv_blocks"], len(self.block_manager.used_block_ids))
                 self.speculative_metrics["peak_gdn_slots"] = max(
@@ -187,6 +199,8 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
+        if self.enable_mtp:
+            self.running.rotate(-1)  # Rotate first claim on bounded speculative resources.
         while (self.running and len(scheduled_seqs) < self.max_num_seqs
                and num_batched_tokens < self.max_num_batched_tokens):
             seq = self.running.popleft()
@@ -229,6 +243,8 @@ class Scheduler:
         if seq in self.waiting:
             self.waiting.remove(seq)
         seq.status = SequenceStatus.WAITING
+        if self.enable_mtp:
+            self.speculative_metrics["preemptions"] += 1
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         if self.gdn_state_manager:
@@ -245,14 +261,24 @@ class Scheduler:
                 self.max_model_len - len(seq), budget - 1)
         k = max(0, k)
         requested = k
+        if self.speculation_policy is not None:
+            load = min(self.speculative_max_batch_size, self.max_num_seqs,
+                       len(self.running) + len(self._step_seqs))
+            if load not in self._policy_choices:
+                self._policy_choices[load] = self.speculation_policy.choose(k, load)
+            k = min(k, self._policy_choices[load])
+            self.speculative_metrics[f"adaptive_selected_k_{k}"] += 1
+            requested = k
         while k >= 0:
             capacity = len(seq) + k + 1
             if not self.block_manager.can_reserve(seq, capacity):
+                self.speculative_metrics["kv_reservation_retries"] += 1
                 k -= 1
                 continue
             slots = (self.gdn_state_manager.reserve_spec_slots(seq, k + 1, self._step_id)
                      if self.gdn_state_manager else ())
             if slots is None:
+                self.speculative_metrics["gdn_reservation_retries"] += 1
                 k -= 1
                 continue
             reservation = self.block_manager.reserve_capacity(seq, capacity)
@@ -267,6 +293,12 @@ class Scheduler:
                 self.speculative_metrics["k_zero_rounds"] += 1
             return
         self.speculative_metrics["fallback_capacity"] += 1
+
+    def observe_speculation(self, observations):
+        for observation in observations:
+            if self.speculation_policy is not None:
+                self.speculation_policy.observe(**observation)
+                self.speculative_metrics["adaptive_observations"] += 1
 
     def _commit_speculative(self, seq, result):
         plan = self.speculative_plans.get(seq.seq_id)
@@ -294,9 +326,10 @@ class Scheduler:
         self.speculative_metrics["emitted_tokens"] += len(result.token_ids)
         self.speculative_metrics["verify_inputs"] += result.stats.get("verify_inputs", 0)
         self.speculative_metrics["target_forwards"] += result.stats.get("target_forwards", 0)
-        if self.speculative_metrics["target_forwards"]:
+        self.speculative_metrics["request_rounds"] += 1
+        if self.speculative_metrics["request_rounds"]:
             self.speculative_metrics["mean_emitted_tokens_per_round"] = (
-                self.speculative_metrics["emitted_tokens"] / self.speculative_metrics["target_forwards"])
+                self.speculative_metrics["emitted_tokens"] / self.speculative_metrics["request_rounds"])
         if result.finished:
             seq.status = SequenceStatus.FINISHED
             self.block_manager.deallocate(seq)
