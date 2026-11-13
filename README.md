@@ -206,6 +206,8 @@ API 通过 `LLM(model_path, enable_mtp=True, enforce_eager=True, num_speculative
 
 启用Graph使用 `enforce_eager=False, enable_gdn_cuda_graph=True`，`cuda_graph_max_batch_size`控制捕获批量上限。普通GDN decode、MTP Verify及MTP模块的固定形状桶可重放，超出捕获范围的输入回退eager。采样和CPU提交在Graph外；padding使用池内独占GRAPH槽，不写活动请求状态。Graph工作区和该槽均计入预算。当前仍只支持TP=1，`reference_numerics=True`不支持此Graph路径。
 
+当前 Verify Graph 最多覆盖 K=4 的窗口，更大窗口回退 eager。MTP 与普通解码都可使用阶段 Graph，MTP 并不保证更快；应按实际输入长度、并发和输出长度比较完整生成耗时。自适应 K 只调整投机窗口，不会自动切换为完全关闭 MTP 的普通模式。Graph 捕获会增加初始化开销，首次调用与预热后的性能应分别测量。
+
 `num_gdn_slots=None`为默认自动模式：按模型真实状态尺寸、并发、上下文和投机需求规划两池。在 `generate()` 开始且没有活动请求时，可根据实际批次重新配比；只有容量差异足够大才释放空闲缓存并重建，Graph同时重捕获。重新配比会使原前缀缓存失效，冷调用耗时包含此成本。活动请求期间不迁移状态；增量`add_request()`沿用当前容量和资源准入。`adapt_cache_to_workload=False`关闭批次间重配；显式整数`num_gdn_slots`固定GDN容量并关闭自动重配。
 
 调度统计位于 `llm.scheduler.speculative_metrics`，包含候选/接受/decode实际输出数、拒绝位置、回退原因和资源峰值。`llm.model_runner.collect_mtp_metrics()` 返回已完成事件的 bootstrap/Draft/Verify/sync GPU 毫秒数；未完成事件延后收集，不在逐 token 路径中同步整个设备。Verify 计时包含 GDN 状态 I/O。
