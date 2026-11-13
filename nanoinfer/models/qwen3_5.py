@@ -3,15 +3,15 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
-from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.attention import Attention, store_kvcache
-from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from nanovllm.layers.gdn_attention import GDNAttention
-from nanovllm.layers.layernorm import GemmaRMSNorm
-from nanovllm.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from nanovllm.layers.rotary_embedding import MRotaryEmbedding
-from nanovllm.models.visionencoder import Qwen3_5VisionEncoder
-from nanovllm.utils.context import get_context
+from nanoinfer.layers.activation import SiluAndMul
+from nanoinfer.layers.attention import Attention, store_kvcache
+from nanoinfer.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from nanoinfer.layers.gdn_attention import GDNAttention
+from nanoinfer.layers.layernorm import GemmaRMSNorm
+from nanoinfer.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanoinfer.layers.rotary_embedding import MRotaryEmbedding
+from nanoinfer.models.visionencoder import Qwen3_5VisionEncoder
+from nanoinfer.utils.context import get_context
 
 
 class Qwen3_5ReferenceNorm(GemmaRMSNorm):
@@ -260,7 +260,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         if getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
         if getattr(text_config, "enable_mtp", False):
-            from nanovllm.models.qwen3_5_mtp import Qwen3_5MTP
+            from nanoinfer.models.qwen3_5_mtp import Qwen3_5MTP
             self.mtp = Qwen3_5MTP(text_config)
             self.packed_modules_scope = ("model.language_model.", "mtp.")
 
@@ -289,7 +289,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         return self.lm_head(hidden_states)
 
     def forward_target(self, input_ids, positions):
-        from nanovllm.engine.speculative import TargetForwardOutput
+        from nanoinfer.engine.speculative import TargetForwardOutput
         hidden = self.forward(input_ids, positions)
         # Native MTP feedback is the residual-merged, final-normalized output.
         return TargetForwardOutput(hidden, hidden)

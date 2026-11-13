@@ -1,11 +1,11 @@
 from collections import Counter, deque
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
-from nanovllm.engine.speculative import SpeculativeStepPlan, SpeculativeResult
-from nanovllm.engine.speculation_policy import SpeculationPolicy
-from nanovllm.engine.gdn_state_manager import (
+from nanoinfer.config import Config
+from nanoinfer.engine.sequence import Sequence, SequenceStatus
+from nanoinfer.engine.block_manager import BlockManager
+from nanoinfer.engine.speculative import SpeculativeStepPlan, SpeculativeResult
+from nanoinfer.engine.speculative import SpeculationPolicy
+from nanoinfer.engine.gdn_state_manager import (
     GDNStateManager, GDNStepPlan, GDNRestoreOp, GDNSaveOp,
 )
 
@@ -51,7 +51,7 @@ class Scheduler:
         self.waiting.append(seq)
 
     def abort(self, seq):
-        """Discard a failed/cancelled request and all decoder state references."""
+        """终止请求并归还 KV、GDN 及未提交的投机资源。"""
         assert self.gdn_plan is None or self.gdn_plan.closed or seq not in self._step_seqs, 'Finalize the GDN step before cancelling a scheduled request'
         plan = self.speculative_plans.get(seq.seq_id)
         if plan is not None and plan.state not in ("COMMITTED", "ABORTED"):
@@ -146,7 +146,6 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -163,7 +162,7 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            if remaining < num_tokens and scheduled_seqs:  # 仅首个请求允许部分 Prefill。
                 break
             start = seq.num_tokens - num_tokens
             end = self._prefill_end(seq, start, min(num_tokens, remaining))
@@ -173,7 +172,7 @@ class Scheduler:
             if not seq.block_table:
                 if checkpoint is not None:
                     self.gdn_state_manager.acquire_checkpoint(checkpoint.slot_id)
-                    # Journal the source lease before any fallible resource allocation.
+                    # 分配资源前记录源租约，分配失败时仍可释放引用。
                     self.gdn_plan.restores.append(GDNRestoreOp(
                         seq.seq_id, checkpoint.slot_id, -1, checkpoint.key[1]))
                 self.block_manager.allocate_with_prefix(seq, prefix_blocks)
@@ -190,17 +189,15 @@ class Scheduler:
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
-            # An important-boundary cut may leave budget, but this request must
-            # not be selected again before its first segment has actually run.
+            # 边界切分后即使还有预算，也须等本段前向完成后才能再次调度。
             if end < seq.num_tokens:
                 break
 
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
         if self.enable_mtp:
-            self.running.rotate(-1)  # Rotate first claim on bounded speculative resources.
+            self.running.rotate(-1)  # 轮换有限投机资源的优先使用权。
         while (self.running and len(scheduled_seqs) < self.max_num_seqs
                and num_batched_tokens < self.max_num_batched_tokens):
             seq = self.running.popleft()
@@ -236,8 +233,7 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         assert self.gdn_plan is None or self.gdn_plan.closed or seq not in self._step_seqs, 'Finalize the GDN step before preempting a scheduled request'
-        # Internal decode scheduling has already popped seq; explicit preemption
-        # must also detach it before re-enqueueing to avoid duplicate execution.
+        # 显式抢占也要先移出原队列，避免重新入队后重复执行。
         if seq in self.running:
             self.running.remove(seq)
         if seq in self.waiting:

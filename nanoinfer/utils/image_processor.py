@@ -9,7 +9,7 @@ from PIL import Image
 from transformers import AutoProcessor
 import torch
 
-from nanovllm.utils.video_processor import load_video
+from nanoinfer.utils.video_processor import load_video
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,7 @@ class VisualItem:
 
     def __post_init__(self):
         pixels = self.pixel_values.detach().cpu().contiguous()
-        digest = sha256(b"nanovllm.visual.v1")
+        digest = sha256(b"nanoinfer.visual.v1")
         for value in (self.modality.encode(), pack("<3q", *self.grid_thw),
                       str(pixels.dtype).encode(),
                       pack("<Q", pixels.ndim) + pack(f"<{pixels.ndim}q", *pixels.shape),

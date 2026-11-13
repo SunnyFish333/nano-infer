@@ -1,121 +1,11 @@
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3MoeConfig
 
-from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.attention import Attention
-from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
-from nanovllm.layers.rotary_embedding import get_rope
-
-
-class Qwen3MoeAttention(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        max_position: int = 4096 * 32,
-        head_dim: int | None = None,
-        rms_norm_eps: float = 1e-06,
-        qkv_bias: bool = False,
-        rope_theta: float = 10000,
-        rope_scaling: dict | None = None,
-    ) -> None:
-        super().__init__()
-        tp_size = dist.get_world_size()
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
-        self.qkv_bias = qkv_bias
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-        )
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=rope_theta,
-        )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-        )
-        if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
-        return output
-
-
-class Qwen3MoeMLP(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-        )
-        assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x = self.down_proj(x)
-        return x
+from nanoinfer.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from nanoinfer.models.qwen3 import Qwen3Attention, Qwen3MLP
+from nanoinfer.layers.layernorm import RMSNorm
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -135,7 +25,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
-                Qwen3MoeMLP(
+                Qwen3MLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=config.moe_intermediate_size,
                     hidden_act=config.hidden_act,
@@ -153,7 +43,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_weights, self.top_k, dim=-1
         )
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
+        # 路由先用 FP32 归一化，再按输入精度执行专家。
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
@@ -162,7 +52,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             device=hidden_states.device,
         )
 
-        # Expert mask: [experts, top_k, tokens].
+        # 专家掩码布局：[experts, top_k, tokens]。
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=self.num_experts
         ).permute(2, 1, 0)
@@ -171,9 +61,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         for expert_idx in expert_hitted:
             expert_idx = expert_idx.item()
             expert_layer = self.experts[expert_idx]
-            # Keep [top_k, tokens] two-dimensional, including top_k == 1.
+            # 保留 [top_k, tokens] 两维，兼容 top_k=1。
             idx, top_x = torch.where(expert_mask[expert_idx])
-            # Weight each expert output by the corresponding token's routing weight.
+            # 专家输出按各 token 的路由权重聚合。
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
             current_hidden_states = (
                 expert_layer(current_state) * routing_weights[top_x, idx, None]
@@ -193,7 +83,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_idx: int = -1,
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen3MoeAttention(
+        self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -210,7 +100,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(config=config)
         else:
-            self.mlp = Qwen3MoeMLP(
+            self.mlp = Qwen3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,

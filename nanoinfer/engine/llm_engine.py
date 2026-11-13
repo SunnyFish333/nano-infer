@@ -6,13 +6,13 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
-from nanovllm.utils.image_processor import ImageProcessor
-from nanovllm.models.qwen3_5 import build_position_ids
-from nanovllm.config import Config
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from nanoinfer.utils.image_processor import ImageProcessor
+from nanoinfer.models.qwen3_5 import build_position_ids
+from nanoinfer.config import Config
+from nanoinfer.sampling_params import SamplingParams
+from nanoinfer.engine.sequence import Sequence
+from nanoinfer.engine.scheduler import Scheduler
+from nanoinfer.engine.model_runner import ModelRunner
 
 
 class LLMEngine:
@@ -99,7 +99,7 @@ class LLMEngine:
                          self.model_runner.call("run", seqs, is_prefill, plan) if plan is not None
                          else self.model_runner.call("run", seqs, is_prefill))
             if getattr(self.scheduler, "enable_mtp", False):
-                self.scheduler.observe_speculation(self.model_runner.drain_speculation_observations())
+                self.scheduler.observe_speculation(self.model_runner.mtp.drain_speculation_observations())
             commit_start = perf_counter()
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
             if getattr(self.scheduler, "enable_mtp", False):

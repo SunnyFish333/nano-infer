@@ -1,7 +1,7 @@
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
-from nanovllm.engine.sequence import Sequence
+from nanoinfer.engine.sequence import Sequence
 
 
 @dataclass

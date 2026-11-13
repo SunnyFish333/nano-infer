@@ -5,7 +5,7 @@ from struct import pack
 
 import torch
 
-from nanovllm.sampling_params import SamplingParams
+from nanoinfer.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
@@ -82,7 +82,7 @@ class Sequence:
             if s >= end:
                 break
             kind = modality.encode()
-            extras.append(b"nanovllm.span.v1" + digest + pack("<Q", len(kind)) + kind
+            extras.append(b"nanoinfer.span.v1" + digest + pack("<Q", len(kind)) + kind
                           + pack("<4q", s, e, max(start, s) - s, min(end, e) - s))
         if self.position_ids is None:
             return tuple(extras)
@@ -92,7 +92,7 @@ class Sequence:
         ordinary = torch.arange(start, end, dtype=torch.long, device="cpu")[None].expand(3, -1)
         if not torch.equal(positions, ordinary):
             coords = positions.reshape(-1).tolist()
-            extras.append(b"nanovllm.positions.v1" + pack(f"<{len(coords)}q", *coords))
+            extras.append(b"nanoinfer.positions.v1" + pack(f"<{len(coords)}q", *coords))
         return tuple(extras)
 
     def __len__(self):

@@ -28,7 +28,7 @@
 
 Nano-Infer 面向 **Qwen 系列模型的离线文本生成与推理机制学习**。项目将模型架构、通用算子、请求调度和 GPU 执行分开组织，让一次生成请求如何经过分块预填充、缓存分配和逐 token 解码，有清晰可读的实现路径。
 
-通过 `LLM` 与 `SamplingParams` 即可提交批量请求。项目沿用上游的发行名 `nano-vllm` 和 Python 导入名 `nanovllm`。
+通过 `LLM` 与 `SamplingParams` 即可提交批量请求。项目发行名与 Python 导入名均为 `nanoinfer`。
 
 下文提供安装、模型准备、批量生成和常用参数说明。
 
@@ -111,10 +111,10 @@ hf download Qwen/Qwen3-0.6B --local-dir "$HOME/huggingface/Qwen3-0.6B"
 ### 03 · 运行文本生成
 
 ```bash
-python example.py
+python example_qwen3.py
 ```
 
-[example.py](example.py) 展示两条请求的聊天模板处理、批量生成与结果打印。示例使用单卡 eager 模式，并显式设置上下文长度、批次 token 预算和显存比例。
+[example_qwen3.py](example_qwen3.py) 展示两条请求的聊天模板处理、批量生成与结果打印。示例使用单卡 eager 模式，并显式设置上下文长度、批次 token 预算和显存比例。
 
 <a name="usage"></a>
 
@@ -128,7 +128,7 @@ python example.py
 import os
 
 from transformers import AutoTokenizer
-from nanovllm import LLM, SamplingParams
+from nanoinfer import LLM, SamplingParams
 
 
 def main():
@@ -210,7 +210,7 @@ API 通过 `LLM(model_path, enable_mtp=True, enforce_eager=True, num_speculative
 
 `num_gdn_slots=None`为默认自动模式：按模型真实状态尺寸、并发、上下文和投机需求规划两池。在 `generate()` 开始且没有活动请求时，可根据实际批次重新配比；只有容量差异足够大才释放空闲缓存并重建，Graph同时重捕获。重新配比会使原前缀缓存失效，冷调用耗时包含此成本。活动请求期间不迁移状态；增量`add_request()`沿用当前容量和资源准入。`adapt_cache_to_workload=False`关闭批次间重配；显式整数`num_gdn_slots`固定GDN容量并关闭自动重配。
 
-调度统计位于 `llm.scheduler.speculative_metrics`，包含候选/接受/decode实际输出数、拒绝位置、回退原因和资源峰值。`llm.model_runner.collect_mtp_metrics()` 返回已完成事件的 bootstrap/Draft/Verify/sync GPU 毫秒数；未完成事件延后收集，不在逐 token 路径中同步整个设备。Verify 计时包含 GDN 状态 I/O。
+调度统计位于 `llm.scheduler.speculative_metrics`，包含候选/接受/decode实际输出数、拒绝位置、回退原因和资源峰值。`llm.model_runner.mtp.collect_mtp_metrics()` 返回已完成事件的 bootstrap/Draft/Verify/sync GPU 毫秒数；未完成事件延后收集，不在逐 token 路径中同步整个设备。Verify 计时包含 GDN 状态 I/O。
 
 ### Qwen3.5 文本与多模态前缀缓存
 

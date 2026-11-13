@@ -1,7 +1,7 @@
 """Stable-address Qwen3.5 stage graphs. Scheduling and sampling remain outside."""
 import torch
 
-from nanovllm.utils.context import get_context, reset_context, set_context
+from nanoinfer.utils.context import get_context, reset_context, set_context
 
 
 def buckets(limit):

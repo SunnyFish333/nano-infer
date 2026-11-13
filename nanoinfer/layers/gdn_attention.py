@@ -3,10 +3,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from nanovllm.layers.layernorm import RMSNormGated
-from nanovllm.layers.linear import ColumnParallelLinear, RowParallelLinear
-from nanovllm.utils.context import get_context
-from nanovllm.layers.gdn_verify import fused_verify
+from nanoinfer.layers.layernorm import RMSNormGated
+from nanoinfer.layers.linear import ColumnParallelLinear, RowParallelLinear
+from nanoinfer.utils.context import get_context
+from nanoinfer.layers.gdn_verify import fused_verify
 
 
 def l2norm(

@@ -5,7 +5,7 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from nanovllm.utils.context import get_context
+from nanoinfer.utils.context import get_context
 
 
 @triton.jit

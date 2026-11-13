@@ -2,8 +2,8 @@
 import torch
 from torch import nn
 
-from nanovllm.layers.linear import ColumnParallelLinear
-from nanovllm.models.qwen3_5 import Qwen3_5DecoderLayer, norm_class
+from nanoinfer.layers.linear import ColumnParallelLinear
+from nanoinfer.models.qwen3_5 import Qwen3_5DecoderLayer, norm_class
 
 
 class Qwen3_5MTP(nn.Module):

@@ -5,7 +5,7 @@ from struct import pack
 import xxhash
 import numpy as np
 
-from nanovllm.engine.sequence import Sequence
+from nanoinfer.engine.sequence import Sequence
 
 
 class Block:
@@ -58,7 +58,7 @@ class BlockManager:
             parent = seq.prefix_hashes[-1] if i else -1
             extras = seq.prefix_extra_keys(i * self.block_size, (i + 1) * self.block_size)
             tokens = seq.block(i)
-            digest = sha256(b"nanovllm.prefix.v1" + (seq.prefix_digests[-1] if i else b""))
+            digest = sha256(b"nanoinfer.prefix.v1" + (seq.prefix_digests[-1] if i else b""))
             token_bytes = pack(f"<{len(tokens)}q", *tokens)
             digest.update(pack("<Q", len(token_bytes)) + token_bytes)
             digest.update(pack("<Q", len(extras)))
@@ -153,7 +153,7 @@ class BlockManager:
         return max(0, count - len(seq.block_table)) <= len(self.free_block_ids)
 
     def reserve_capacity(self, seq, capacity):
-        from nanovllm.engine.speculative import CapacityReservation
+        from nanoinfer.engine.speculative import CapacityReservation
         if not self.can_reserve(seq, capacity):
             return None
         reservation = CapacityReservation(seq, len(seq.block_table), capacity)

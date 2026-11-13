@@ -6,22 +6,21 @@ from multiprocessing.shared_memory import SharedMemory
 import torch
 import torch.distributed as dist
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
-from nanovllm.models.registry import build_model
-from nanovllm.layers.sampler import Sampler
-from nanovllm.layers.sampler import probabilities, sample_probs
-from nanovllm.layers.rejection_sampler import rejection_sample
-from nanovllm.engine.speculative import DraftOutput, VerifyOutput, SpeculativeResult, TargetForwardOutput
-from nanovllm.engine.mtp_runner import BatchedMTPRunner
-from nanovllm.engine.cache_budget import plan_cache_budget
-from nanovllm.engine.stage_graphs import StageGraphs
-from nanovllm.layers.gdn_attention import GDNAttention
-from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from nanoinfer.config import Config
+from nanoinfer.engine.sequence import Sequence
+from nanoinfer.models.registry import build_model
+from nanoinfer.layers.sampler import Sampler
+from nanoinfer.layers.sampler import probabilities, sample_probs
+from nanoinfer.engine.mtp_runner import MTPRunner
+from nanoinfer.engine.cache_budget import plan_cache_budget
+from nanoinfer.engine.stage_graphs import StageGraphs
+from nanoinfer.layers.gdn_attention import GDNAttention
+from nanoinfer.layers.rotary_embedding import get_rope
+from nanoinfer.utils.context import set_context, get_context, reset_context
+from nanoinfer.utils.loader import load_model
 
 
-class ModelRunner(BatchedMTPRunner):
+class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -37,6 +36,7 @@ class ModelRunner(BatchedMTPRunner):
         self.mtp_gpu_times = {}
         self.profile_state_io = False
         self.mtp_observations = []
+        self.mtp = MTPRunner(self)
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -45,7 +45,7 @@ class ModelRunner(BatchedMTPRunner):
         try:
             torch.set_default_dtype(hf_config.dtype)
             torch.set_default_device("cuda")
-            # Build the complete model; decoder dimensions come from text_config.
+            # 构建语言和视觉模型；Decoder 维度取自 text_config。
             hf_config.reference_numerics = getattr(config, "reference_numerics", False)
             hf_config.enable_mtp = getattr(config, "enable_mtp", False)
             if getattr(config, "vision_config", None) is not None:
@@ -56,7 +56,7 @@ class ModelRunner(BatchedMTPRunner):
             config.has_gdn = bool(self.gdn_layers)
             if config.has_gdn:
                 assert self.world_size == 1, 'GDN state scheduling v1 requires tensor_parallel_size=1'
-                self.enforce_eager = True  # Legacy graph path; Qwen3.5 uses explicit stage graphs.
+                self.enforce_eager = True  # 禁用旧 Graph 路径；Qwen3.5 使用显式阶段 Graph。
                 if not getattr(config, "enable_gdn_cuda_graph", False):
                     config.enforce_eager = True
             load_model(self.model, config.model)
@@ -65,7 +65,7 @@ class ModelRunner(BatchedMTPRunner):
             self.workspace_bytes = max(0, torch.cuda.memory_stats()["allocated_bytes.all.peak"]
                                        - torch.cuda.memory_stats()["allocated_bytes.all.current"])
             if config.enable_mtp:
-                # Retained seeds/tails, target feedback through sync, and simultaneous p/q.
+                # 预算包括种子、分块尾状态、Sync 前保留的目标反馈和同时存活的 p/q。
                 self.workspace_bytes += (4 * config.max_num_batched_tokens * hf_config.hidden_size
                                          * hf_config.dtype.itemsize
                                          + 2 * config.max_num_seqs * hf_config.hidden_size * hf_config.dtype.itemsize
@@ -95,11 +95,11 @@ class ModelRunner(BatchedMTPRunner):
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name="nanoinfer", create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name="nanoinfer")
                 self.loop()
 
     def exit(self):
@@ -113,14 +113,15 @@ class ModelRunner(BatchedMTPRunner):
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        self.collect_mtp_metrics()
-        self.drain_speculation_observations()
+        self.mtp.collect_mtp_metrics()
+        self.mtp.drain_speculation_observations()
         dist.destroy_process_group()
-        # Linear parameters carry bound loader methods, so model objects can form
-        # cycles. Release pools and collect them before constructing another engine.
+        # 参数的绑定 loader 会形成引用环；下次构建引擎前先释放池并回收对象。
         for name in ("model", "gdn_layers", "target_attention_layers", "draft_attention_layers",
-                     "kv_cache", "conv_cache", "ssm_cache", "stage_graphs"):
+                     "kv_cache", "conv_cache", "ssm_cache", "stage_graphs", "graph_vars"):
             self.__dict__.pop(name, None)
+        # Qwen3 的共享 RoPE LRU 也持有 GPU 缓冲，退出时必须归还该引用。
+        get_rope.cache_clear()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -189,7 +190,7 @@ class ModelRunner(BatchedMTPRunner):
         torch.cuda.reset_peak_memory_stats()
         self.model.encode_vision(pixels, torch.tensor([[1, h, w]], device="cpu"))
         torch.cuda.synchronize()
-        # Visual features are staged per step; reserve both encoder and transfer space.
+        # 视觉特征分步传入；同时预留编码和传输空间。
         vision_peak = torch.cuda.max_memory_allocated() - before + pixels.numel()*pixels.element_size()
         feature_bytes = (self.config.max_num_batched_tokens * self.config.text_config.hidden_size
                          * vision.patch_embed.proj.weight.element_size())
@@ -289,8 +290,7 @@ class ModelRunner(BatchedMTPRunner):
         free, total = torch.cuda.mem_get_info()
         budget = int(total * self.config.gpu_memory_utilization) - (total - free) - self.workspace_bytes
         assert required_bytes <= budget, 'GDN state pools exceed the memory budget; reduce num_gdn_slots'
-        # Keep a single byte budget across both allocations. Driver free-memory
-        # queries may include allocator retention and need not track each tensor.
+        # 两种池共用字节预算；驱动空闲量还受分配器保留空间影响。
         self.cache_allocation_budget = budget
         # 与 KV cache 一样，统一按 [层, ...] 开辟；各层持有对应切片的视图。
         conv_cache = torch.zeros(num_layers, *conv_shape, dtype=conv_dtype, device="cuda")
@@ -336,10 +336,9 @@ class ModelRunner(BatchedMTPRunner):
 
     @torch.inference_mode()
     def rebalance_idle_cache(self, length, concurrency, spec_batch, checkpoint_requests=0):
-        """Resize only with no active requests; all old prefix identities are invalidated.
+        """仅在请求为空时重配，清空旧前缀身份并重捕获阶段 Graph。
 
-        The engine replaces its empty Scheduler after success. Active workloads never
-        migrate states or change addresses; stage graphs are recaptured after resizing.
+        成功后引擎替换空 Scheduler；活动请求期间不迁移状态或改变地址。
         """
         config = self.config
         self.cache_workload = (min(length, config.max_model_len), min(concurrency, config.max_num_seqs), spec_batch)
@@ -364,9 +363,9 @@ class ModelRunner(BatchedMTPRunner):
         if (config.num_gdn_slots >= minimum and
                 abs(desired.gdn_slots-config.num_gdn_slots) < max(2, config.num_gdn_slots//4)):
             return False
-        torch.cuda.synchronize()  # Rare idle reconfiguration, never the per-token path.
-        self.collect_mtp_metrics()
-        self.drain_speculation_observations()
+        torch.cuda.synchronize()  # 空闲重配时同步，不进入逐 token 热路径。
+        self.mtp.collect_mtp_metrics()
+        self.mtp.drain_speculation_observations()
         for layer in self.target_attention_layers + self.draft_attention_layers:
             layer.k_cache = layer.v_cache = torch.tensor([], device="cuda")
         for layer in self.gdn_layers:
@@ -433,7 +432,7 @@ class ModelRunner(BatchedMTPRunner):
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
+            if not seq.block_table:    # 预热尚无物理块表。
                 continue
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
@@ -446,7 +445,7 @@ class ModelRunner(BatchedMTPRunner):
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # 存在已缓存前缀。
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         if any(pos.ndim == 2 for pos in positions):
@@ -514,8 +513,8 @@ class ModelRunner(BatchedMTPRunner):
     def run(self, seqs: list[Sequence], is_prefill: bool, gdn_plan=None, speculative_plans=None):
         if not is_prefill and any(getattr(seq, "mtp_enabled", False) for seq in seqs):
             if getattr(self.config, "mtp_batch_execution", False):
-                return self.run_speculative_batch(seqs, gdn_plan, speculative_plans or {})
-            return self.run_speculative(seqs, gdn_plan, speculative_plans or {})
+                return self.mtp.run_speculative_batch(seqs, gdn_plan, speculative_plans or {})
+            return self.mtp.run_speculative(seqs, gdn_plan, speculative_plans or {})
         return self._run_normal(seqs, is_prefill, gdn_plan)
 
     @torch.inference_mode()
@@ -539,14 +538,14 @@ class ModelRunner(BatchedMTPRunner):
             if bootstrap:
                 for i, seq in enumerate(seqs):
                     if seq.mtp_enabled:
-                        rng = self.mtp_state(seq)["rng"]
+                        rng = self.mtp.mtp_state(seq)["rng"]
                         p = probabilities(logits[i:i+1], temperatures[i:i+1])[0]
                         tokens[i] = int(p.argmax() if seq.temperature == 0 else sample_probs(p, rng))
                 offset = 0
                 for seq, token in zip(seqs, tokens):
                     count = seq.num_scheduled_tokens
                     if seq.mtp_enabled:
-                        self.profile_mtp("bootstrap_ms", lambda: self.bootstrap_mtp(
+                        self.mtp.profile_mtp("bootstrap_ms", lambda: self.mtp.bootstrap_mtp(
                             seq, hidden[offset:offset+count], token))
                     offset += count
             if gdn_plan is not None:
@@ -554,182 +553,6 @@ class ModelRunner(BatchedMTPRunner):
             return tokens
         finally:
             reset_context()
-
-    def mtp_state(self, seq):
-        state = self.mtp_requests.get(seq.seq_id)
-        if state is None:
-            rng = torch.Generator(device="cuda")
-            rng.manual_seed((torch.initial_seed() + seq.seq_id) % (2**63 - 1))
-            state = self.mtp_requests[seq.seq_id] = {"rng": rng}
-        return state
-
-    def profile_mtp(self, stage, function):
-        if self.model.lm_head.weight.device.type != "cuda":
-            return function()
-        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        begin.record()
-        value = function()
-        end.record()
-        self.mtp_profile_events.append((stage, begin, end))
-        return value
-
-    def collect_mtp_metrics(self):
-        pending = []
-        for stage, begin, end in getattr(self, "mtp_profile_events", []):
-            if end.query():
-                self.mtp_gpu_times[stage] = self.mtp_gpu_times.get(stage, 0.) + begin.elapsed_time(end)
-            else:
-                pending.append((stage, begin, end))
-        self.mtp_profile_events = pending
-        return dict(getattr(self, "mtp_gpu_times", {}))
-
-    def prepare_window(self, seq, start, token_ids, mode, state_slots=()):
-        """Paged multi-query context, bottom-right aligned against start+T keys."""
-        end, count = start + len(token_ids), len(token_ids)
-        device = self.model.lm_head.weight.device
-        tensor = lambda value, dtype=torch.int32: torch.tensor(value, dtype=dtype, device=device)
-        slots = [seq.block_table[i // self.block_size] * self.block_size + i % self.block_size
-                 for i in range(start, end)]
-        segments = [(0, count, seq.gdn_slot, state_slots)] if mode == "verify" else None
-        set_context(True, tensor([0, count]), tensor([0, end]), count, end,
-                    tensor(slots), block_tables=self.prepare_block_tables([seq]),
-                    gdn_slots=tensor([seq.gdn_slot], torch.int64), gdn_has_initial=[start > 0],
-                    mode=mode, gdn_verify_segments=segments,
-                    state_io_events=(self.mtp_profile_events if getattr(self, "profile_state_io", False)
-                                     and mode == "verify" else None))
-        return tensor(token_ids, torch.int64), tensor(list(range(start, end)), torch.int64)
-
-    def sync_mtp(self, seq, hidden, successors, start):
-        ids, positions = self.prepare_window(seq, start, successors, "sync")
-        output = self.run_mtp_module(ids, positions, hidden)
-        self.mtp_state(seq)["seed"] = output[-1:].clone()
-        seq.draft_cached_len = seq.draft_spec_end = start + len(successors)
-
-    def bootstrap_mtp(self, seq, hidden, pending):
-        start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
-        if end == len(seq) and (seq.num_completion_tokens + 1 >= seq.max_tokens
-                or (not seq.ignore_eos and pending == self.config.eos)
-                or end >= self.config.max_model_len):
-            return  # A terminal request has no future proposal seed to build.
-        state = self.mtp_state(seq)
-        if start == 0:
-            state.pop("tail", None)
-            state.pop("seed", None)
-            seq.draft_cached_len = seq.draft_spec_end = 0
-        feedback, successors = [], []
-        if start:
-            assert "tail" in state and seq.draft_cached_len == start - 1
-            feedback.append(state.pop("tail"))
-            successors.append(seq[start])
-        if len(hidden) > 1:
-            feedback.append(hidden[:-1])
-            successors.extend(seq[start+1:end])
-        if end == len(seq):
-            feedback.append(hidden[-1:])
-            successors.append(pending)
-        else:
-            state["tail"] = hidden[-1:].clone()
-        if successors:
-            self.sync_mtp(seq, torch.cat(feedback), successors, seq.draft_cached_len)
-
-    def proposal(self, seq, plan):
-        state, candidates, qs = self.mtp_state(seq), [], []
-        hidden = state["seed"]
-        temperature = torch.tensor([seq.temperature], device=hidden.device)
-        for i in range(plan.k):
-            q = probabilities(self.model.lm_head.project(hidden), temperature)[0]
-            token = int(q.argmax() if seq.temperature == 0 else sample_probs(q, state["rng"]))
-            candidates.append(token)
-            qs.append(q)
-            if not seq.ignore_eos and token == self.config.eos:
-                break
-            if i + 1 < plan.k:
-                ids, pos = self.prepare_window(seq, plan.draft_start + i, [token], "draft")
-                hidden = self.run_mtp_module(ids, pos, hidden)
-        end = plan.draft_start + max(0, len(candidates) - 1)
-        seq.draft_spec_end = end
-        vocab = self.config.text_config.vocab_size
-        return DraftOutput(candidates, torch.stack(qs) if qs else hidden.new_empty((0, vocab), dtype=torch.float32), end)
-
-    @torch.inference_mode()
-    def run_speculative(self, seqs, gdn_plan, plans):
-        try:
-            self.collect_mtp_metrics()
-            if gdn_plan is not None:
-                self.copy_gdn_states(gdn_plan, True)
-            results = []
-            for seq in seqs:
-                if not seq.mtp_enabled:
-                    results.extend(self._run_normal([seq], False))
-                    continue
-                state = self.mtp_state(seq)
-                plan = plans.get(seq.seq_id)
-                start = seq.num_cached_tokens
-                assert seq.draft_cached_len == start == len(seq) - 1
-                if plan is None:
-                    # No scratch slots: ordinary in-place single-token execution.
-                    ids, pos = self.prepare_decode([seq])
-                    output = self.model.forward_target(ids, pos)
-                    logits = self.model.lm_head.project(output.logit_hidden)
-                    p = probabilities(logits, torch.tensor([seq.temperature], device=logits.device))[0]
-                    token = int(p.argmax() if seq.temperature == 0 else sample_probs(p, state["rng"]))
-                    emitted, accepted, selected = [token], 0, -1
-                    feedback = output.mtp_hidden
-                else:
-                    draft = self.profile_mtp("draft_ms", lambda: self.proposal(seq, plan))
-                    count = len(draft.token_ids) + 1
-                    slots = plan.state_slots[:count]
-                    ids, pos = self.prepare_window(seq, start, [seq.last_token] + draft.token_ids, "verify", slots)
-                    verify = self.profile_mtp("verify_ms", lambda: self.verify_target(ids, pos, slots))
-                    plan.state = "EXECUTED"
-                    p = probabilities(verify.logits, torch.full((count,), seq.temperature, device=ids.device))
-                    decision = rejection_sample(draft.token_ids, p, draft.probabilities,
-                                                greedy=seq.temperature == 0, generator=state["rng"])
-                    emitted, accepted = decision.token_ids, decision.accepted
-                    selected = slots[accepted]
-                    feedback = verify.hidden[:len(emitted)]
-                    plan.state = "DECIDED"
-                remaining = seq.max_tokens - seq.num_completion_tokens
-                emitted = emitted[:remaining]
-                if not seq.ignore_eos and self.config.eos in emitted:
-                    emitted = emitted[:emitted.index(self.config.eos)+1]
-                finished = (len(emitted) == remaining or (not seq.ignore_eos and emitted[-1] == self.config.eos)
-                            or start + len(emitted) >= self.config.max_model_len)
-                end = start + len(emitted)
-                if not finished:
-                    self.profile_mtp("sync_ms", lambda: self.sync_mtp(seq, feedback[:len(emitted)], emitted, start))
-                if plan is not None:
-                    plan.state = "SYNCHRONIZED"
-                results.append(SpeculativeResult(seq.seq_id, emitted, accepted, end,
-                               end if not finished else seq.draft_cached_len, selected, finished,
-                               {"proposed": len(draft.token_ids) if plan else 0,
-                                "verify_inputs": count if plan else 1,
-                                "target_forwards": 1}))
-            if gdn_plan is not None:
-                self.copy_gdn_states(gdn_plan, False)
-                gdn_plan.completed = True
-            return results
-        finally:
-            reset_context()
-
-    def verify_target(self, input_ids, positions, slots):
-        output = self.target_output(input_ids, positions)
-        return VerifyOutput(self.model.lm_head.project(output.logit_hidden), output.mtp_hidden, slots, True)
-
-    def target_output(self, input_ids, positions):
-        if hasattr(self, "stage_graphs"):
-            mode = "verify" if get_context().mode == "verify" else "decode"
-            hidden = self.stage_graphs.replay(mode, input_ids, positions)
-            if hidden is not None:
-                return TargetForwardOutput(hidden, hidden)
-        return self.model.forward_target(input_ids, positions)
-
-    def run_mtp_module(self, ids, positions, hidden):
-        if hasattr(self, "stage_graphs"):
-            output = self.stage_graphs.replay("mtp", ids, positions, hidden)
-            if output is not None:
-                return output
-        return self.model.mtp(self.model.model.language_model.embed_tokens(ids), positions, hidden)
 
     def copy_gdn_states(self, plan, restore: bool):
         operations = ([(op.checkpoint_slot, op.working_slot) for op in plan.restores]
@@ -752,7 +575,7 @@ class ModelRunner(BatchedMTPRunner):
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        # Always cover the configured maximum, including limits such as 10/17.
+        # 包含非标准上限（如 10/17），保证所有允许的 batch 均有桶。
         candidates = [1, 2, 4, 8, max_bs] + list(range(16, max_bs + 1, 16))
         self.graph_bs = sorted({bs for bs in candidates if 1 <= bs <= max_bs})
         self.graphs = {}
@@ -761,9 +584,9 @@ class ModelRunner(BatchedMTPRunner):
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # 预热
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # 捕获
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
