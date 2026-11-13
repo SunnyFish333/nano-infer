@@ -164,9 +164,9 @@ class Qwen3_5MLP(nn.Module):
 
 
 class Qwen3_5DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, layer_type: str | None = None):
         super().__init__()
-        self.layer_type = config.layer_types[layer_idx]
+        self.layer_type = layer_type or config.layer_types[layer_idx]
         if self.layer_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
         elif self.layer_type == "linear_attention":
@@ -258,10 +258,14 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         self.lm_head = ParallelLMHead(text_config.vocab_size, text_config.hidden_size)
         if getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
+        if getattr(text_config, "enable_mtp", False):
+            from nanovllm.models.qwen3_5_mtp import Qwen3_5MTP
+            self.mtp = Qwen3_5MTP(text_config)
+            self.packed_modules_scope = ("model.language_model.", "mtp.")
 
     def map_weight_name(self, name: str) -> str | None:
         if name.startswith(("mtp.", "model.mtp.")):
-            return None
+            return name.removeprefix("model.") if hasattr(self, "mtp") else None
         if name.startswith("visual."):
             name = "model." + name
         if name.startswith("model.visual.") and self.model.visual is None:
@@ -282,6 +286,23 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def forward_target(self, input_ids, positions):
+        from nanovllm.engine.speculative import TargetForwardOutput
+        hidden = self.forward(input_ids, positions)
+        # Native MTP feedback is the residual-merged, final-normalized output.
+        return TargetForwardOutput(hidden, hidden)
+
+    def required_mtp_weights(self):
+        required = set()
+        if hasattr(self, "mtp"):
+            for name, _ in self.mtp.named_parameters():
+                if "gate_up_proj" in name:
+                    required.update("mtp." + name.replace("gate_up_proj", part)
+                                    for part in ("gate_proj", "up_proj"))
+                else:
+                    required.add("mtp." + name)
+        return required
 
 
 # Backward-compatible class name; both names refer to the unified implementation.

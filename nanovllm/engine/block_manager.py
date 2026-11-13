@@ -140,11 +140,47 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        if seq.mtp_enabled:
+            return self.can_reserve(seq, len(seq))
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+        if len(seq.block_table) < seq.num_blocks:
             seq.block_table.append(self._allocate_block())
+
+    def can_reserve(self, seq, capacity):
+        count = (capacity + self.block_size - 1) // self.block_size
+        return max(0, count - len(seq.block_table)) <= len(self.free_block_ids)
+
+    def reserve_capacity(self, seq, capacity):
+        from nanovllm.engine.speculative import CapacityReservation
+        if not self.can_reserve(seq, capacity):
+            return None
+        reservation = CapacityReservation(seq, len(seq.block_table), capacity)
+        while len(seq.block_table) * self.block_size < capacity:
+            seq.block_table.append(self._allocate_block())
+        return reservation
+
+    def _trim_capacity(self, seq, count):
+        while len(seq.block_table) > count:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+    def commit_capacity(self, reservation, retained_capacity):
+        if reservation.closed:
+            return
+        assert 0 <= retained_capacity <= reservation.required_capacity
+        count = (retained_capacity + self.block_size - 1) // self.block_size
+        self._trim_capacity(reservation.seq, max(reservation.old_blocks, count))
+        reservation.closed = True
+
+    def cancel_reservation(self, reservation):
+        if not reservation.closed:
+            self._trim_capacity(reservation.seq, reservation.old_blocks)
+            reservation.closed = True
 
     def hash_blocks(self, seq: Sequence):
         if not self.enable_prefix_cache or not seq.prefix_cacheable:

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 
 @dataclass(slots=True)
@@ -8,4 +9,4 @@ class SamplingParams:
     ignore_eos: bool = False
 
     def __post_init__(self):
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        assert math.isfinite(self.temperature) and self.temperature >= 0, "temperature must be finite and nonnegative"

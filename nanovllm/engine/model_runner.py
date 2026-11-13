@@ -10,6 +10,9 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import build_model
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sampler import probabilities, sample_probs
+from nanovllm.layers.rejection_sampler import rejection_sample
+from nanovllm.engine.speculative import DraftOutput, VerifyOutput, SpeculativeResult
 from nanovllm.layers.gdn_attention import GDNAttention
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -26,6 +29,10 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.visual_requests = {}
+        self.mtp_requests = {}
+        self.mtp_profile_events = []
+        self.mtp_gpu_times = {}
+        self.profile_state_io = False
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -36,6 +43,7 @@ class ModelRunner:
             torch.set_default_device("cuda")
             # Build the complete model; decoder dimensions come from text_config.
             hf_config.reference_numerics = getattr(config, "reference_numerics", False)
+            hf_config.enable_mtp = getattr(config, "enable_mtp", False)
             if getattr(config, "vision_config", None) is not None:
                 config.vision_config.reference_numerics = hf_config.reference_numerics
             self.model = build_model(config.hf_config)
@@ -50,6 +58,12 @@ class ModelRunner:
             self.warmup_model()
             self.workspace_bytes = max(0, torch.cuda.memory_stats()["allocated_bytes.all.peak"]
                                        - torch.cuda.memory_stats()["allocated_bytes.all.current"])
+            if config.enable_mtp:
+                # Retained seeds/tails, target feedback through sync, and simultaneous p/q.
+                self.workspace_bytes += (4 * config.max_num_batched_tokens * hf_config.hidden_size
+                                         * hf_config.dtype.itemsize
+                                         + 2 * config.max_num_seqs * hf_config.hidden_size * hf_config.dtype.itemsize
+                                         + 3 * (config.num_speculative_tokens + 1) * hf_config.vocab_size * 4)
             self.warmup_vision()
             self.allocate_gdn_cache()
             self.allocate_kv_cache()
@@ -73,6 +87,7 @@ class ModelRunner:
 
     def exit(self):
         self.visual_requests.clear()
+        self.mtp_requests.clear()
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -81,10 +96,12 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
+        self.collect_mtp_metrics()
         dist.destroy_process_group()
         # Linear parameters carry bound loader methods, so model objects can form
         # cycles. Release pools and collect them before constructing another engine.
-        for name in ("model", "gdn_layers", "kv_cache", "conv_cache", "ssm_cache"):
+        for name in ("model", "gdn_layers", "target_attention_layers", "draft_attention_layers",
+                     "kv_cache", "conv_cache", "ssm_cache"):
             self.__dict__.pop(name, None)
         gc.collect()
         torch.cuda.empty_cache()
@@ -129,6 +146,14 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
+        if getattr(self.config, "enable_mtp", False):
+            with torch.inference_mode():
+                ids, positions = self.prepare_prefill(seqs)
+                hidden = torch.zeros(ids.shape[0], self.config.text_config.hidden_size, device="cuda")
+                draft = self.model.mtp(self.model.model.language_model.embed_tokens(ids), positions, hidden)
+                logits = self.model.lm_head.project(draft[-(self.config.num_speculative_tokens + 1):])
+                probabilities(logits, torch.ones(logits.shape[0], device="cuda"))
+                reset_context()
         torch.cuda.empty_cache()
 
     @torch.inference_mode()
@@ -160,6 +185,8 @@ class ModelRunner:
     def release_visual(self, seq_ids):
         for seq_id in seq_ids:
             self.visual_requests.pop(seq_id, None)
+            if hasattr(self, "mtp_requests"):
+                self.mtp_requests.pop(seq_id, None)
 
     @torch.inference_mode()
     def prepare_visual_inputs(self, seqs, is_prefill):
@@ -219,8 +246,13 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        attention_layers = [module for module in self.model.modules()
-                            if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
+        target_root = self.model.model if getattr(self.config, "enable_mtp", False) else self.model
+        target_layers = [module for module in target_root.modules()
+                         if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
+        draft_layers = ([layer.self_attn.attn for layer in self.model.mtp.layers]
+                        if getattr(self.config, "enable_mtp", False) else [])
+        self.target_attention_layers, self.draft_attention_layers = target_layers, draft_layers
+        attention_layers = target_layers + draft_layers
         assert attention_layers, 'This scheduler requires at least one full-attention layer'
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -350,23 +382,208 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool, gdn_plan=None) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, gdn_plan=None, speculative_plans=None):
+        if not is_prefill and any(getattr(seq, "mtp_enabled", False) for seq in seqs):
+            return self.run_speculative(seqs, gdn_plan, speculative_plans or {})
+        return self._run_normal(seqs, is_prefill, gdn_plan)
+
+    @torch.inference_mode()
+    def _run_normal(self, seqs, is_prefill, gdn_plan=None):
         try:
             if gdn_plan is not None:
                 self.copy_gdn_states(gdn_plan, restore=True)
             visual = self.prepare_visual_inputs(seqs, is_prefill) if getattr(self, "visual_requests", None) else None
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-            logits = (self.run_model(input_ids, positions, is_prefill, visual)
-                      if visual is not None else self.run_model(input_ids, positions, is_prefill))
+            bootstrap = is_prefill and any(getattr(seq, "mtp_enabled", False) for seq in seqs)
+            if bootstrap:
+                hidden = self.model(input_ids, positions, *visual) if visual is not None else self.model(input_ids, positions)
+                logits = self.model.compute_logits(hidden)
+            else:
+                logits = (self.run_model(input_ids, positions, is_prefill, visual)
+                          if visual is not None else self.run_model(input_ids, positions, is_prefill))
             if gdn_plan is not None:
                 self.copy_gdn_states(gdn_plan, restore=False)
             tokens = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            if bootstrap:
+                for i, seq in enumerate(seqs):
+                    if seq.mtp_enabled:
+                        rng = self.mtp_state(seq)["rng"]
+                        p = probabilities(logits[i:i+1], temperatures[i:i+1])[0]
+                        tokens[i] = int(p.argmax() if seq.temperature == 0 else sample_probs(p, rng))
+                offset = 0
+                for seq, token in zip(seqs, tokens):
+                    count = seq.num_scheduled_tokens
+                    if seq.mtp_enabled:
+                        self.profile_mtp("bootstrap_ms", lambda: self.bootstrap_mtp(
+                            seq, hidden[offset:offset+count], token))
+                    offset += count
             if gdn_plan is not None:
                 gdn_plan.completed = True
             return tokens
         finally:
             reset_context()
+
+    def mtp_state(self, seq):
+        state = self.mtp_requests.get(seq.seq_id)
+        if state is None:
+            rng = torch.Generator(device="cuda")
+            rng.manual_seed((torch.initial_seed() + seq.seq_id) % (2**63 - 1))
+            state = self.mtp_requests[seq.seq_id] = {"rng": rng}
+        return state
+
+    def profile_mtp(self, stage, function):
+        if self.model.lm_head.weight.device.type != "cuda":
+            return function()
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        value = function()
+        end.record()
+        self.mtp_profile_events.append((stage, begin, end))
+        return value
+
+    def collect_mtp_metrics(self):
+        pending = []
+        for stage, begin, end in getattr(self, "mtp_profile_events", []):
+            if end.query():
+                self.mtp_gpu_times[stage] = self.mtp_gpu_times.get(stage, 0.) + begin.elapsed_time(end)
+            else:
+                pending.append((stage, begin, end))
+        self.mtp_profile_events = pending
+        return dict(getattr(self, "mtp_gpu_times", {}))
+
+    def prepare_window(self, seq, start, token_ids, mode, state_slots=()):
+        """Paged multi-query context, bottom-right aligned against start+T keys."""
+        end, count = start + len(token_ids), len(token_ids)
+        device = self.model.lm_head.weight.device
+        tensor = lambda value, dtype=torch.int32: torch.tensor(value, dtype=dtype, device=device)
+        slots = [seq.block_table[i // self.block_size] * self.block_size + i % self.block_size
+                 for i in range(start, end)]
+        segments = [(0, count, seq.gdn_slot, state_slots)] if mode == "verify" else None
+        set_context(True, tensor([0, count]), tensor([0, end]), count, end,
+                    tensor(slots), block_tables=self.prepare_block_tables([seq]),
+                    gdn_slots=tensor([seq.gdn_slot], torch.int64), gdn_has_initial=[start > 0],
+                    mode=mode, gdn_verify_segments=segments,
+                    state_io_events=(self.mtp_profile_events if getattr(self, "profile_state_io", False)
+                                     and mode == "verify" else None))
+        return tensor(token_ids, torch.int64), tensor(list(range(start, end)), torch.int64)
+
+    def sync_mtp(self, seq, hidden, successors, start):
+        ids, positions = self.prepare_window(seq, start, successors, "sync")
+        output = self.model.mtp(self.model.model.language_model.embed_tokens(ids), positions, hidden)
+        self.mtp_state(seq)["seed"] = output[-1:].clone()
+        seq.draft_cached_len = seq.draft_spec_end = start + len(successors)
+
+    def bootstrap_mtp(self, seq, hidden, pending):
+        start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
+        if end == len(seq) and (seq.num_completion_tokens + 1 >= seq.max_tokens
+                or (not seq.ignore_eos and pending == self.config.eos)
+                or end >= self.config.max_model_len):
+            return  # A terminal request has no future proposal seed to build.
+        state = self.mtp_state(seq)
+        if start == 0:
+            state.pop("tail", None)
+            state.pop("seed", None)
+            seq.draft_cached_len = seq.draft_spec_end = 0
+        feedback, successors = [], []
+        if start:
+            assert "tail" in state and seq.draft_cached_len == start - 1
+            feedback.append(state.pop("tail"))
+            successors.append(seq[start])
+        if len(hidden) > 1:
+            feedback.append(hidden[:-1])
+            successors.extend(seq[start+1:end])
+        if end == len(seq):
+            feedback.append(hidden[-1:])
+            successors.append(pending)
+        else:
+            state["tail"] = hidden[-1:].clone()
+        if successors:
+            self.sync_mtp(seq, torch.cat(feedback), successors, seq.draft_cached_len)
+
+    def proposal(self, seq, plan):
+        state, candidates, qs = self.mtp_state(seq), [], []
+        hidden = state["seed"]
+        temperature = torch.tensor([seq.temperature], device=hidden.device)
+        for i in range(plan.k):
+            q = probabilities(self.model.lm_head.project(hidden), temperature)[0]
+            token = int(q.argmax() if seq.temperature == 0 else sample_probs(q, state["rng"]))
+            candidates.append(token)
+            qs.append(q)
+            if not seq.ignore_eos and token == self.config.eos:
+                break
+            if i + 1 < plan.k:
+                ids, pos = self.prepare_window(seq, plan.draft_start + i, [token], "draft")
+                hidden = self.model.mtp(self.model.model.language_model.embed_tokens(ids), pos, hidden)
+        end = plan.draft_start + max(0, len(candidates) - 1)
+        seq.draft_spec_end = end
+        vocab = self.config.text_config.vocab_size
+        return DraftOutput(candidates, torch.stack(qs) if qs else hidden.new_empty((0, vocab), dtype=torch.float32), end)
+
+    @torch.inference_mode()
+    def run_speculative(self, seqs, gdn_plan, plans):
+        try:
+            self.collect_mtp_metrics()
+            if gdn_plan is not None:
+                self.copy_gdn_states(gdn_plan, True)
+            results = []
+            for seq in seqs:
+                if not seq.mtp_enabled:
+                    results.extend(self._run_normal([seq], False))
+                    continue
+                state = self.mtp_state(seq)
+                plan = plans.get(seq.seq_id)
+                start = seq.num_cached_tokens
+                assert seq.draft_cached_len == start == len(seq) - 1
+                if plan is None:
+                    # No scratch slots: ordinary in-place single-token execution.
+                    ids, pos = self.prepare_decode([seq])
+                    output = self.model.forward_target(ids, pos)
+                    logits = self.model.lm_head.project(output.logit_hidden)
+                    p = probabilities(logits, torch.tensor([seq.temperature], device=logits.device))[0]
+                    token = int(p.argmax() if seq.temperature == 0 else sample_probs(p, state["rng"]))
+                    emitted, accepted, selected = [token], 0, -1
+                    feedback = output.mtp_hidden
+                else:
+                    draft = self.profile_mtp("draft_ms", lambda: self.proposal(seq, plan))
+                    count = len(draft.token_ids) + 1
+                    slots = plan.state_slots[:count]
+                    ids, pos = self.prepare_window(seq, start, [seq.last_token] + draft.token_ids, "verify", slots)
+                    verify = self.profile_mtp("verify_ms", lambda: self.verify_target(ids, pos, slots))
+                    plan.state = "EXECUTED"
+                    p = probabilities(verify.logits, torch.full((count,), seq.temperature, device=ids.device))
+                    decision = rejection_sample(draft.token_ids, p, draft.probabilities,
+                                                greedy=seq.temperature == 0, generator=state["rng"])
+                    emitted, accepted = decision.token_ids, decision.accepted
+                    selected = slots[accepted]
+                    feedback = verify.hidden[:len(emitted)]
+                    plan.state = "DECIDED"
+                remaining = seq.max_tokens - seq.num_completion_tokens
+                emitted = emitted[:remaining]
+                if not seq.ignore_eos and self.config.eos in emitted:
+                    emitted = emitted[:emitted.index(self.config.eos)+1]
+                finished = (len(emitted) == remaining or (not seq.ignore_eos and emitted[-1] == self.config.eos)
+                            or start + len(emitted) >= self.config.max_model_len)
+                end = start + len(emitted)
+                if not finished:
+                    self.profile_mtp("sync_ms", lambda: self.sync_mtp(seq, feedback[:len(emitted)], emitted, start))
+                if plan is not None:
+                    plan.state = "SYNCHRONIZED"
+                results.append(SpeculativeResult(seq.seq_id, emitted, accepted, end,
+                               end if not finished else seq.draft_cached_len, selected, finished,
+                               {"proposed": len(draft.token_ids) if plan else 0,
+                                "verify_inputs": count if plan else 1,
+                                "target_forwards": 1}))
+            if gdn_plan is not None:
+                self.copy_gdn_states(gdn_plan, False)
+                gdn_plan.completed = True
+            return results
+        finally:
+            reset_context()
+
+    def verify_target(self, input_ids, positions, slots):
+        output = self.model.forward_target(input_ids, positions)
+        return VerifyOutput(self.model.lm_head.project(output.logit_hidden), output.mtp_hidden, slots, True)
 
     def copy_gdn_states(self, plan, restore: bool):
         operations = ([(op.checkpoint_slot, op.working_slot) for op in plan.restores]

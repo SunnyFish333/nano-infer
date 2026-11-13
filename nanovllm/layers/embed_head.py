@@ -58,6 +58,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
+        return self.project(x)
+
+    def project(self, x: torch.Tensor, rows: torch.Tensor | None = None):
+        """Project all supplied rows, or explicit indices, independent of execution mode."""
+        if rows is not None:
+            x = x[rows].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None

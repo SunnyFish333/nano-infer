@@ -226,7 +226,9 @@ class GDNAttention(nn.Module):
         assert not warmup or self.conv_pool.numel() == 0, 'GDN convolution and recurrent caches must be initialized together'
         assert not warmup or context.is_prefill, 'GDN decode requires initialized state caches; warmup supports prefill only'
         assert warmup or context.gdn_slots is not None, 'GDN execution requires context.gdn_slots'
-        if context.is_prefill:
+        if context.mode == "verify":
+            core = self._verify_segments(mixed_qkv, g, beta, context.gdn_verify_segments)
+        elif context.is_prefill:
             assert context.cu_seqlens_q is not None, 'GDN prefill requires context.cu_seqlens_q'
             cu = context.cu_seqlens_q.tolist()
             if warmup:
@@ -248,6 +250,32 @@ class GDNAttention(nn.Module):
         core = self.norm(core.reshape(-1, self.head_v_dim),
                          z.reshape(-1, self.head_v_dim))
         return self.out_proj(core.reshape(-1, self.value_dim))
+
+    def _verify_segments(self, mixed_qkv, g, beta, segments):
+        """Short scans after batched projections; every position owns a full snapshot.
+
+        Reuse the single-step recurrence's arithmetic, with the previous snapshot as
+        the source. The original WORKING slot is never a destination.
+        """
+        core = torch.empty(mixed_qkv.shape[0], self.value_dim,
+                           dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+        for start, end, source, destinations in segments:
+            assert end - start == len(destinations) and source not in destinations
+            for row, destination in zip(range(start, end), destinations):
+                events = get_context().state_io_events
+                if events is not None:
+                    begin, finish = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    begin.record()
+                self.conv_pool[destination].copy_(self.conv_pool[source])
+                self.ssm_pool[destination].copy_(self.ssm_pool[source])
+                if events is not None:
+                    finish.record()
+                    events.append(("snapshot_copy_ms", begin, finish))
+                slot = torch.tensor([destination], device=mixed_qkv.device, dtype=torch.long)
+                core[row:row+1] = self._decode_batch(mixed_qkv[row:row+1], g[row:row+1],
+                                                    beta[row:row+1], slot)
+                source = destination
+        return core
 
     def _prefill_segment(
         self,

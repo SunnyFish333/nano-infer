@@ -13,6 +13,8 @@ class GDNSlot:
     ref_count: int = 0
     status: str = "FREE"
     owner_seq_id: int | None = None
+    step_id: int | None = None
+    position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,10 @@ class GDNStateManager:
         seq.num_gdn_cached_tokens = 0
 
     def deallocate(self, seq: Sequence):
+        for slot in tuple(self.used_slots):
+            state = self.slots[slot]
+            if state.status == "SPECULATIVE" and state.owner_seq_id == seq.seq_id:
+                self._release_exclusive(slot)
         if seq.gdn_slot != -1:
             state = self.slots[seq.gdn_slot]
             assert state.status == 'WORKING' and state.owner_seq_id == seq.seq_id, 'GDN working slot ownership mismatch'
@@ -170,3 +176,41 @@ class GDNStateManager:
             self.free_slots.append(seq.gdn_slot)
         seq.gdn_slot = -1
         seq.num_gdn_cached_tokens = 0
+
+    def _release_exclusive(self, slot):
+        self.used_slots.remove(slot)
+        self.slots[slot] = GDNSlot(slot)
+        self.free_slots.append(slot)
+
+    def reserve_spec_slots(self, seq, count, step_id):
+        # Check first, so failed reservations do not partially evict checkpoints.
+        if len(self.free_slots) + len(self.evictable) < count:
+            return None
+        result = []
+        for position in range(count):
+            slot = self._take_slot()
+            self.slots[slot] = GDNSlot(slot, status="SPECULATIVE", owner_seq_id=seq.seq_id,
+                                       step_id=step_id, position=position)
+            self.used_slots.add(slot)
+            result.append(slot)
+        return tuple(result)
+
+    def cancel_spec_slots(self, seq_id, slots, step_id):
+        for slot in slots:
+            state = self.slots[slot]
+            if (state.status == "SPECULATIVE" and state.owner_seq_id == seq_id
+                    and state.step_id == step_id):
+                self._release_exclusive(slot)
+
+    def promote_spec_slot(self, seq, slots, selected, step_id):
+        assert selected in slots
+        state = self.slots[selected]
+        assert (state.status == "SPECULATIVE" and state.owner_seq_id == seq.seq_id
+                and state.step_id == step_id)
+        old = seq.gdn_slot
+        assert self.slots[old].status == "WORKING" and self.slots[old].owner_seq_id == seq.seq_id
+        state.status = "WORKING"
+        state.step_id = state.position = None
+        seq.gdn_slot = selected
+        self._release_exclusive(old)
+        self.cancel_spec_slots(seq.seq_id, slots, step_id)

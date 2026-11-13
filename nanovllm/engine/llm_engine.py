@@ -83,20 +83,31 @@ class LLMEngine:
 
     def step(self):
         try:
+            schedule_start = perf_counter()
             seqs, is_prefill = self.scheduler.schedule()
+            if getattr(self.scheduler, "enable_mtp", False):
+                self.scheduler.speculative_metrics["schedule_host_ms"] += (perf_counter() - schedule_start) * 1000
+            before = sum(seq.num_completion_tokens for seq in seqs)
             num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
             plan = getattr(self.scheduler, "gdn_plan", None)
-            token_ids = (self.model_runner.call("run", seqs, is_prefill, plan) if plan is not None
+            speculative = getattr(self.scheduler, "speculative_plans", {})
+            token_ids = (self.model_runner.call("run", seqs, is_prefill, plan, speculative) if speculative else
+                         self.model_runner.call("run", seqs, is_prefill, plan) if plan is not None
                          else self.model_runner.call("run", seqs, is_prefill))
+            commit_start = perf_counter()
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
-            if getattr(self.model_runner, "visual_requests", None):
+            if getattr(self.scheduler, "enable_mtp", False):
+                self.scheduler.speculative_metrics["commit_host_ms"] += (perf_counter() - commit_start) * 1000
+            if not is_prefill:
+                num_tokens = -(sum(seq.num_completion_tokens for seq in seqs) - before)
+            if getattr(self.model_runner, "visual_requests", None) or getattr(self.model_runner, "mtp_requests", None):
                 self.model_runner.release_visual([seq.seq_id for seq in seqs if seq.is_finished])
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
             return outputs, num_tokens
         except BaseException:
             affected = getattr(self.scheduler, "_step_seqs", [])
             self.scheduler.rollback_step()
-            if getattr(self.model_runner, "visual_requests", None):
+            if getattr(self.model_runner, "visual_requests", None) or getattr(self.model_runner, "mtp_requests", None):
                 self.model_runner.release_visual([seq.seq_id for seq in affected])
             raise
 

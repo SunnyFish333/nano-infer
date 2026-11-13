@@ -1,8 +1,9 @@
-from collections import deque
+from collections import Counter, deque
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.speculative import SpeculativeStepPlan, SpeculativeResult
 from nanovllm.engine.gdn_state_manager import (
     GDNStateManager, GDNStepPlan, GDNRestoreOp, GDNSaveOp,
 )
@@ -25,6 +26,13 @@ class Scheduler:
         ) if config.has_gdn else None)
         self.gdn_plan: GDNStepPlan | None = None
         self._step_seqs: list[Sequence] = []
+        self.enable_mtp = getattr(config, "enable_mtp", False)
+        self.num_speculative_tokens = getattr(config, "num_speculative_tokens", 1)
+        self.speculative_max_batch_size = getattr(config, "speculative_max_batch_size", 1)
+        self.max_model_len = getattr(config, "max_model_len", 2**31 - 1)
+        self.speculative_plans = {}
+        self._step_id = 0
+        self.speculative_metrics = Counter()
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -32,11 +40,21 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        seq.mtp_enabled = self.enable_mtp and not seq.visual_spans
+        if seq.mtp_enabled:
+            seq.prefix_cacheable = False
+        elif self.enable_mtp:
+            self.speculative_metrics["fallback_multimodal"] += 1
         self.waiting.append(seq)
 
     def abort(self, seq):
         """Discard a failed/cancelled request and all decoder state references."""
         assert self.gdn_plan is None or self.gdn_plan.closed or seq not in self._step_seqs, 'Finalize the GDN step before cancelling a scheduled request'
+        plan = self.speculative_plans.get(seq.seq_id)
+        if plan is not None and plan.state not in ("COMMITTED", "ABORTED"):
+            self.block_manager.cancel_reservation(plan.reservation)
+            self.gdn_state_manager.cancel_spec_slots(seq.seq_id, plan.state_slots, plan.step_id)
+            plan.state = "ABORTED"
         for queue in (self.waiting, self.running):
             if seq in queue:
                 queue.remove(seq)
@@ -62,6 +80,12 @@ class Scheduler:
         return blocks, checkpoint
 
     def rollback_step(self):
+        for plan in self.speculative_plans.values():
+            if plan.state not in ("COMMITTED", "ABORTED"):
+                self.block_manager.cancel_reservation(plan.reservation)
+                if self.gdn_state_manager:
+                    self.gdn_state_manager.cancel_spec_slots(plan.seq_id, plan.state_slots, plan.step_id)
+                plan.state = "ABORTED"
         if self.gdn_plan is not None:
             self.gdn_state_manager.finish_plan(self.gdn_plan, False)
         for seq in self._step_seqs:
@@ -82,8 +106,16 @@ class Scheduler:
         assert self.gdn_plan is None or self.gdn_plan.closed, 'Previous GDN step has not been finalized'
         self.gdn_plan = GDNStepPlan() if self.gdn_prefix_enabled else None
         self._step_seqs = []
+        self.speculative_plans = {}
+        self._step_id += 1
         try:
             seqs, is_prefill = self._schedule()
+            if self.enable_mtp:
+                self.speculative_metrics["peak_kv_blocks"] = max(
+                    self.speculative_metrics["peak_kv_blocks"], len(self.block_manager.used_block_ids))
+                self.speculative_metrics["peak_gdn_slots"] = max(
+                    self.speculative_metrics["peak_gdn_slots"],
+                    len(self.gdn_state_manager.slots) - len(self.gdn_state_manager.free_slots))
             if self.gdn_plan is not None:
                 for seq in seqs:
                     end = seq.num_cached_tokens + seq.num_scheduled_tokens
@@ -155,7 +187,8 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        while (self.running and len(scheduled_seqs) < self.max_num_seqs
+               and num_batched_tokens < self.max_num_batched_tokens):
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -168,6 +201,10 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
+                if seq.mtp_enabled:
+                    budget = self.max_num_batched_tokens - num_batched_tokens
+                    self._reserve_speculative(seq, budget)
+                num_batched_tokens += seq.num_scheduled_tokens
                 scheduled_seqs.append(seq)
         if not scheduled_seqs:
             if self.waiting and not self.running:
@@ -197,7 +234,77 @@ class Scheduler:
         if self.gdn_state_manager:
             self.gdn_state_manager.deallocate(seq)
         seq.num_scheduled_tokens = 0
+        seq.draft_cached_len = seq.draft_spec_end = 0
         self.waiting.appendleft(seq)
+
+    def _reserve_speculative(self, seq, budget):
+        if len(self.speculative_plans) >= self.speculative_max_batch_size:
+            self.speculative_metrics["fallback_batch_limit"] += 1
+            return
+        k = min(self.num_speculative_tokens, seq.max_tokens - seq.num_completion_tokens - 1,
+                self.max_model_len - len(seq), budget - 1)
+        k = max(0, k)
+        requested = k
+        while k >= 0:
+            capacity = len(seq) + k + 1
+            if not self.block_manager.can_reserve(seq, capacity):
+                k -= 1
+                continue
+            slots = (self.gdn_state_manager.reserve_spec_slots(seq, k + 1, self._step_id)
+                     if self.gdn_state_manager else ())
+            if slots is None:
+                k -= 1
+                continue
+            reservation = self.block_manager.reserve_capacity(seq, capacity)
+            assert reservation is not None
+            self.speculative_plans[seq.seq_id] = SpeculativeStepPlan(
+                self._step_id, seq.seq_id, k, seq.num_cached_tokens, seq.draft_cached_len,
+                reservation, seq.gdn_slot, slots)
+            seq.num_scheduled_tokens = k + 1
+            if k < requested:
+                self.speculative_metrics["shortened_windows"] += 1
+            if k == 0:
+                self.speculative_metrics["k_zero_rounds"] += 1
+            return
+        self.speculative_metrics["fallback_capacity"] += 1
+
+    def _commit_speculative(self, seq, result):
+        plan = self.speculative_plans.get(seq.seq_id)
+        assert result.seq_id == seq.seq_id and result.token_ids
+        assert result.target_cached_len == seq.num_cached_tokens + len(result.token_ids)
+        if plan is not None:
+            assert plan.state == "SYNCHRONIZED", "MTP synchronization must precede publication"
+            self.gdn_state_manager.promote_spec_slot(seq, plan.state_slots,
+                                                   result.selected_slot, plan.step_id)
+        seq.append_tokens(result.token_ids)
+        seq.num_cached_tokens = result.target_cached_len
+        seq.num_gdn_cached_tokens = result.target_cached_len
+        seq.draft_cached_len = result.draft_cached_len
+        seq.draft_spec_end = result.draft_cached_len
+        seq.num_scheduled_tokens = 0
+        if plan is not None:
+            self.block_manager.commit_capacity(plan.reservation, len(seq))
+            plan.state = "COMMITTED"
+            self.speculative_metrics["speculative_rounds"] += 1
+            self.speculative_metrics[f"accepted_{result.accepted}"] += 1
+            if result.accepted < result.stats.get("proposed", 0):
+                self.speculative_metrics[f"rejected_at_{result.accepted}"] += 1
+        self.speculative_metrics["proposed_tokens"] += result.stats.get("proposed", 0)
+        self.speculative_metrics["accepted_tokens"] += result.accepted
+        self.speculative_metrics["emitted_tokens"] += len(result.token_ids)
+        self.speculative_metrics["verify_inputs"] += result.stats.get("verify_inputs", 0)
+        self.speculative_metrics["target_forwards"] += result.stats.get("target_forwards", 0)
+        if self.speculative_metrics["target_forwards"]:
+            self.speculative_metrics["mean_emitted_tokens_per_round"] = (
+                self.speculative_metrics["emitted_tokens"] / self.speculative_metrics["target_forwards"])
+        if result.finished:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            if self.gdn_state_manager:
+                self.gdn_state_manager.deallocate(seq)
+            self.running.remove(seq)
+        else:
+            assert seq.num_cached_tokens == seq.draft_cached_len == len(seq) - 1
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         assert len(seqs) == len(token_ids), 'Runner must return one token per scheduled sequence'
@@ -207,6 +314,9 @@ class Scheduler:
         if self.gdn_plan is not None:
             self.gdn_state_manager.finish_plan(self.gdn_plan, True)
         for seq, token_id in zip(seqs, token_ids):
+            if isinstance(token_id, SpeculativeResult):
+                self._commit_speculative(seq, token_id)
+                continue
             if self.gdn_state_manager:
                 assert seq.gdn_slot >= 0
                 assert seq.num_gdn_cached_tokens == seq.num_cached_tokens
@@ -216,7 +326,8 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if ((not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
+                    or (seq.mtp_enabled and seq.num_cached_tokens >= self.max_model_len)):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 if self.gdn_state_manager:

@@ -16,6 +16,9 @@ class Context:
 
     gdn_slots: torch.Tensor | None = None   # GDN：本轮每个请求使用的状态槽位，[请求数]
     gdn_has_initial: list[bool] | None = None   # GDN：每个请求是否有可续算的历史状态，供 prefill 分支使用
+    mode: str = "normal"
+    gdn_verify_segments: list[tuple[int, int, int, tuple[int, ...]]] | None = None
+    state_io_events: list | None = None  # Optional diagnostic profiling; never synchronizes here.
 
 
 _CONTEXT = Context()
@@ -35,12 +38,16 @@ def set_context(
     context_lens=None,
     block_tables=None,
     gdn_slots=None,
-    gdn_has_initial=None
+    gdn_has_initial=None,
+    mode="normal",
+    gdn_verify_segments=None,
+    state_io_events=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
         is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-        slot_mapping, context_lens, block_tables, gdn_slots, gdn_has_initial
+        slot_mapping, context_lens, block_tables, gdn_slots, gdn_has_initial,
+        mode, gdn_verify_segments, state_io_events,
     )
 
 

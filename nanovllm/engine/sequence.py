@@ -40,6 +40,17 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.position_ids = None  # CPU [3,prompt_length]; tensors stay on the owner process.
         self.rope_delta = 0
+        self.mtp_enabled = False
+        self.draft_cached_len = 0
+        self.draft_spec_end = 0
+
+    @property
+    def target_cached_len(self):
+        return self.num_cached_tokens
+
+    def append_tokens(self, token_ids):
+        for token_id in token_ids:
+            self.append_token(token_id)
 
     def positions(self, start, end):
         """Slice original prompt positions and reconstruct generated text after preemption."""
