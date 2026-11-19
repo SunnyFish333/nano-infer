@@ -22,6 +22,7 @@ __pycache__/
 
 # 测试报告与运行日志
 /test-results/
+/benchmark-results/
 *.log
 
 # 按仓库规则仅本地维护的测试和开发规范

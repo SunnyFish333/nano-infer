@@ -526,15 +526,21 @@ class ModelRunner:
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
             bootstrap = is_prefill and any(getattr(seq, "mtp_enabled", False) for seq in seqs)
+            profile = getattr(self.config, "profile_mtp", False)
             if bootstrap:
-                hidden = self.model(input_ids, positions, *visual) if visual is not None else self.model(input_ids, positions)
-                logits = self.model.compute_logits(hidden)
+                forward = lambda: (self.model(input_ids, positions, *visual) if visual is not None else self.model(input_ids, positions))
+                hidden = self.mtp.profile_mtp("target_prefill_hidden_ms", forward) if profile else forward()
+                logits = (self.mtp.profile_mtp("target_prefill_logits_ms", lambda: self.model.compute_logits(hidden))
+                          if profile else self.model.compute_logits(hidden))
             else:
-                logits = (self.run_model(input_ids, positions, is_prefill, visual)
+                forward = lambda: (self.run_model(input_ids, positions, is_prefill, visual)
                           if visual is not None else self.run_model(input_ids, positions, is_prefill))
+                logits = self.mtp.profile_mtp("target_prefill_forward_logits_ms" if is_prefill else "target_decode_forward_logits_ms", forward) if profile else forward()
             if gdn_plan is not None:
                 self.copy_gdn_states(gdn_plan, restore=False)
-            tokens = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            sample = lambda: self.sampler(logits, temperatures)
+            tokens = ((self.mtp.profile_mtp("ordinary_sampling_ms", sample) if profile else sample()).tolist()
+                      if self.rank == 0 else None)
             if bootstrap:
                 for i, seq in enumerate(seqs):
                     if seq.mtp_enabled:

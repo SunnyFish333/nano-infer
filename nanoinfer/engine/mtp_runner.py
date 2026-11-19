@@ -116,7 +116,9 @@ class MTPRunner:
             selected = plan.state_slots[accepted] if plan is not None else -1
             results.append(SpeculativeResult(seq.seq_id, emitted, accepted, end,
                            end if not finished else seq.draft_cached_len, selected, finished,
-                           {"proposed": k, "verify_inputs": inputs, "target_forwards": 0}))
+                           {"proposed": k, "verify_inputs": inputs, "target_forwards": 0,
+                            "accepted_committed": min(accepted, len(emitted)),
+                            "truncated_accepted": max(0, accepted - len(emitted))}))
         if sync_seqs:
             self.profile_mtp("sync_ms", lambda: self.sync_mtp_batch(sync_seqs, sync_hidden, sync_tokens, starts))
         for plan in plans:
@@ -126,7 +128,9 @@ class MTPRunner:
         return results
 
     def _execute_verify_batch(self, seqs, plans):
-        if self.runner.model.lm_head.weight.is_cuda:
+        observe = self.runner.model.lm_head.weight.is_cuda and (getattr(self.runner.config, "profile_mtp", False)
+                  or getattr(self.runner.config, "adaptive_speculation", False))
+        if observe:
             begin = torch.cuda.Event(enable_timing=True)
             begin.record()
         drafts = self.profile_mtp("draft_ms", lambda: self.proposal_batch(seqs, plans))
@@ -140,14 +144,14 @@ class MTPRunner:
         verify = self.profile_mtp("verify_ms", lambda: self.verify_target(ids, positions, ()))
         temperatures = torch.tensor([seq.temperature for seq, ids in zip(seqs, tokens) for _ in range(ids.numel())],
                                     device=device)
-        p = probabilities(verify.logits, temperatures)
+        p = self.profile_mtp("sampling_probabilities_ms", lambda: probabilities(verify.logits, temperatures))
         payload, hidden_rows = [], []
         for i, (seq, plan, draft) in enumerate(zip(seqs, plans, drafts)):
             plan.state = "EXECUTED"
             left, right = bounds[i:i+2]
-            output, accepted = rejection_sample_device(draft.token_ids, p[left:right], draft.probabilities,
+            output, accepted = self.profile_mtp("sampling_decision_ms", lambda: rejection_sample_device(draft.token_ids, p[left:right], draft.probabilities,
                                                        greedy=seq.temperature == 0,
-                                                       generator=self.mtp_state(seq)["rng"])
+                                                       generator=self.mtp_state(seq)["rng"]))
             payload.append(torch.cat((accepted[None], output)))
             hidden_rows.append(verify.hidden[left:right])
         data = torch.cat(payload).tolist()  # 每个验证组一次回读紧凑的提交数据。
@@ -158,7 +162,7 @@ class MTPRunner:
             offset += k + 2
             plan.state = "DECIDED"
         results = self._finish_batch(seqs, plans, decisions, hidden_rows, lengths, [k+1 for k in lengths])
-        if self.runner.model.lm_head.weight.is_cuda and len({plan.k for plan in plans}) == 1:
+        if observe and len({plan.k for plan in plans}) == 1:
             finish = torch.cuda.Event(enable_timing=True)
             finish.record()
             self.runner.mtp_observations.append((begin, finish, len(seqs), plans[0].k,
@@ -223,7 +227,8 @@ class MTPRunner:
         return state
 
     def profile_mtp(self, stage, function):
-        if self.runner.model.lm_head.weight.device.type != "cuda":
+        if (self.runner.model.lm_head.weight.device.type != "cuda"
+                or not getattr(self.runner.config, "profile_mtp", False)):
             return function()
         begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record()
@@ -363,7 +368,9 @@ class MTPRunner:
                                end if not finished else seq.draft_cached_len, selected, finished,
                                {"proposed": len(draft.token_ids) if plan else 0,
                                 "verify_inputs": count if plan else 1,
-                                "target_forwards": 1}))
+                                "target_forwards": 1,
+                                "accepted_committed": min(accepted, len(emitted)),
+                                "truncated_accepted": max(0, accepted - len(emitted))}))
             if gdn_plan is not None:
                 self.runner.copy_gdn_states(gdn_plan, False)
                 gdn_plan.completed = True

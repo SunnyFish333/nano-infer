@@ -1,0 +1,2 @@
+# Additional dependency for dataset preparation only.
+pyarrow==21.0.0

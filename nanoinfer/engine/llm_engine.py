@@ -13,11 +13,13 @@ from nanoinfer.sampling_params import SamplingParams
 from nanoinfer.engine.sequence import Sequence
 from nanoinfer.engine.scheduler import Scheduler
 from nanoinfer.engine.model_runner import ModelRunner
+from nanoinfer.engine.metrics import EngineMetrics
 
 
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        self.metrics = EngineMetrics() if kwargs.pop("collect_metrics", False) else None
         config_fields = {field.name for field in fields(Config) if field.init}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -76,6 +78,8 @@ class LLMEngine:
         if getattr(self, "_cache_reconfiguration_failed", False):
             raise RuntimeError("Cache reconfiguration failed; close and recreate this engine")
         self.scheduler.add(seq)
+        if getattr(self, "metrics", None) is not None:
+            self.metrics.enqueue(seq)
         return seq.seq_id
 
     def abort_requests(self, seqs):
@@ -89,8 +93,14 @@ class LLMEngine:
         try:
             schedule_start = perf_counter()
             seqs, is_prefill = self.scheduler.schedule()
-            if getattr(self.scheduler, "enable_mtp", False):
-                self.scheduler.speculative_metrics["schedule_host_ms"] += (perf_counter() - schedule_start) * 1000
+            metrics = getattr(self, "metrics", None)
+            observe_host = metrics is not None or getattr(self.scheduler, "enable_mtp", False)
+            schedule_ms = (perf_counter()-schedule_start)*1000 if observe_host else 0.
+            if metrics is not None:
+                observed_before = metrics.scheduled(seqs, self.scheduler)
+                metrics.snapshot(self.scheduler, "scheduled")
+            if observe_host:
+                self.scheduler.speculative_metrics["schedule_host_ms"] += schedule_ms
             before = sum(seq.num_completion_tokens for seq in seqs)
             num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
             plan = getattr(self.scheduler, "gdn_plan", None)
@@ -100,15 +110,24 @@ class LLMEngine:
                          else self.model_runner.call("run", seqs, is_prefill))
             if getattr(self.scheduler, "enable_mtp", False):
                 self.scheduler.observe_speculation(self.model_runner.mtp.drain_speculation_observations())
+            if metrics is not None:
+                metrics.snapshot(self.scheduler, "executed")
             commit_start = perf_counter()
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
-            if getattr(self.scheduler, "enable_mtp", False):
+            if observe_host:
                 self.scheduler.speculative_metrics["commit_host_ms"] += (perf_counter() - commit_start) * 1000
             if not is_prefill:
                 num_tokens = -(sum(seq.num_completion_tokens for seq in seqs) - before)
             if getattr(self.model_runner, "visual_requests", None) or getattr(self.model_runner, "mtp_requests", None):
                 self.model_runner.release_visual([seq.seq_id for seq in seqs if seq.is_finished])
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            if metrics is not None:
+                graphs = getattr(self.model_runner, "stage_graphs", None)
+                trace = list(graphs.trace or []) if graphs is not None else []
+                if graphs is not None and graphs.trace is not None:
+                    graphs.trace.clear()
+                metrics.committed(seqs, observed_before, is_prefill, schedule_start, trace)
+                metrics.snapshot(self.scheduler, "committed")
             return outputs, num_tokens
         except BaseException:
             affected = getattr(self.scheduler, "_step_seqs", [])

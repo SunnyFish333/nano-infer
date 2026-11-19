@@ -232,6 +232,7 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        self.speculative_metrics["preemptions"] += 1
         assert self.gdn_plan is None or self.gdn_plan.closed or seq not in self._step_seqs, 'Finalize the GDN step before preempting a scheduled request'
         # 显式抢占也要先移出原队列，避免重新入队后重复执行。
         if seq in self.running:
@@ -319,6 +320,12 @@ class Scheduler:
                 self.speculative_metrics[f"rejected_at_{result.accepted}"] += 1
         self.speculative_metrics["proposed_tokens"] += result.stats.get("proposed", 0)
         self.speculative_metrics["accepted_tokens"] += result.accepted
+        proposed = result.stats.get("proposed", 0)
+        self.speculative_metrics["true_speculative_rounds"] += int(proposed > 0)
+        self.speculative_metrics["true_speculative_emitted_tokens"] += len(result.token_ids) if proposed > 0 else 0
+        self.speculative_metrics["zero_draft_rounds"] += int(proposed == 0)
+        self.speculative_metrics["accepted_committed_tokens"] += result.stats.get("accepted_committed", min(result.accepted, len(result.token_ids)))
+        self.speculative_metrics["truncated_accepted_tokens"] += result.stats.get("truncated_accepted", max(0, result.accepted-len(result.token_ids)))
         self.speculative_metrics["emitted_tokens"] += len(result.token_ids)
         self.speculative_metrics["verify_inputs"] += result.stats.get("verify_inputs", 0)
         self.speculative_metrics["target_forwards"] += result.stats.get("target_forwards", 0)

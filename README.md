@@ -32,7 +32,7 @@ Nano Infer 基于 [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) 扩�
 需要 **Linux / WSL2、NVIDIA CUDA GPU、Python 3.10–3.12**。先准备匹配的 [PyTorch CUDA / torchvision](https://pytorch.org/get-started/locally/) 环境，并满足 [FlashAttention 安装要求](https://github.com/Dao-AILab/flash-attention#installation-and-features)。以下命令在已激活的 Python 环境中执行：
 
 ```bash
-git clone https://github.com/SunnyFish333/nano-infer.git
+git clone --branch benchmark https://github.com/SunnyFish333/nano-infer.git
 cd nano-infer
 python -m pip install packaging ninja psutil
 python -m pip install -r requirements.txt --no-build-isolation
@@ -97,6 +97,19 @@ python example_qwen3.py
 ```
 
 运行 `python example_qwen3_5.py --help` 查看全部示例参数。MTP 默认关闭，收益取决于负载；Graph 会增加捕获开销。显存不足时，先降低上下文长度、批量或媒体输入大小。
+
+## 性能基准
+
+`benchmark` 分支提供 Qwen3.5 Dense 的单 GPU 离线性能基准，覆盖 CUDA Graph、固定批次合批、前缀缓存热命中、MTP 投机解码、持续并发和容量扩展。运行环境要求见上文「安装」。
+
+在仓库根目录运行以下命令查看完整实验计划，无需加载模型或准备数据。
+
+```bash
+python -m benchmark plan --groups ABCDE
+```
+
+- [实验设计与指标](benchmark/README.md)
+- [数据准备、运行与结果汇总](benchmark/USAGE.md)
 
 ## 许可与致谢
 

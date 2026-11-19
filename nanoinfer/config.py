@@ -33,6 +33,7 @@ class Config:
     video_fps: float = 2.0
     reference_numerics: bool = False
     enable_mtp: bool = False
+    profile_mtp: bool = False  # Diagnostic CUDA timings; independent of enable_mtp.
     num_speculative_tokens: int = 1
     speculative_max_batch_size: int = 1
     mtp_batch_execution: bool = True

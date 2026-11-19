@@ -33,6 +33,7 @@ class StageGraphs:
         self.hidden = torch.empty_like(self.feedback)
         self.graphs, self.pool = {}, None
         self.replays = {}
+        self.trace = None
         self._capture(config.enable_mtp)
 
     def _context(self, mode, batch, queries):
@@ -81,14 +82,21 @@ class StageGraphs:
         context = get_context()
         batch = context.gdn_slots.numel() if mode == "decode" else context.cu_seqlens_q.numel()-1
         queries = ids.numel()
+        def observe(outcome, reason=None, bucket=None):
+            if self.trace is not None:
+                self.trace.append(dict(mode=mode, batch_size=batch, queries=queries,
+                                       outcome=outcome, reason=reason, bucket=bucket))
         if batch > self.max_batch or queries > self.max_queries:
+            observe("fallback", "capacity")
             return None
         if mode == "verify" and (context.gdn_verify_destinations is None
                                   or context.gdn_verify_destinations.shape[1] > self.max_t):
+            observe("fallback", "verify_destinations")
             return None
         b = next(value for value in buckets(self.max_batch) if value >= batch)
         q = b if mode == "decode" else next(value for value in buckets(self.max_queries) if value >= queries)
         if q < b or (mode, b, q) not in self.graphs:
+            observe("fallback", "missing_bucket")
             return None
         self.ids[:queries].copy_(ids)
         self.ids[queries:q].zero_()
@@ -116,5 +124,6 @@ class StageGraphs:
             self.feedback[:queries].copy_(feedback)
             self.feedback[queries:q].zero_()
         self.graphs[mode, b, q].replay()
+        observe("replay", bucket=[b, q])
         self.replays[mode] = self.replays.get(mode, 0) + 1
         return self.hidden[:queries]
